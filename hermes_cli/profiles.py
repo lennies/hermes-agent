@@ -136,6 +136,33 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+_HOST_GLOBAL_CONFIG_KEYS = frozenset({"global_instructions_file"})
+
+
+def _strip_host_global_profile_config(profile_dir: Path) -> None:
+    """Remove host-global keys from a copied/staged named-profile config."""
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        data = read_user_config_raw(config_path)
+    except Exception:
+        # A malformed config cannot manufacture a usable setting; the normal
+        # config loader will surface it independently.
+        return
+    if not isinstance(data, dict) or not (_HOST_GLOBAL_CONFIG_KEYS & data.keys()):
+        return
+    for key in _HOST_GLOBAL_CONFIG_KEYS:
+        data.pop(key, None)
+
+    # Never rewrite through a cloned symlink into the source profile.
+    if config_path.is_symlink():
+        config_path.unlink()
+    from hermes_cli.config import atomic_config_write
+
+    atomic_config_write(config_path, data, sort_keys=False)
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
@@ -1289,6 +1316,7 @@ def create_profile(
     # desktop/status surfaces don't warn that a just-created profile is
     # v0/outdated. Leave --clone-all snapshots byte-for-byte apart from the
     # explicit runtime/history stripping above.
+    _strip_host_global_profile_config(profile_dir)
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
 
@@ -2206,6 +2234,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 ignore=_default_export_ignore(profile_dir),
             )
             _stage_extras(staged)
+            _strip_host_global_profile_config(staged)
             _scrub_export_secrets(staged)
             result = _make_profile_archive(base, tmpdir, "default")
             return Path(result)
@@ -2221,6 +2250,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
         )
         _stage_extras(staged)
+        _strip_host_global_profile_config(staged)
         _scrub_export_secrets(staged)
         result = _make_profile_archive(base, tmpdir, canon)
         return Path(result)
@@ -2360,6 +2390,8 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         if archive_root != canon:
             final_source = staging_root / canon
             extracted.rename(final_source)
+
+        _strip_host_global_profile_config(final_source)
 
         shutil.move(str(final_source), str(profile_dir))
 

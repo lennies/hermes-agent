@@ -12,8 +12,6 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-_SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
-
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
 
 _CATEGORY_COLORS = {
@@ -24,6 +22,7 @@ _CATEGORY_COLORS = {
     "mcp": "var(--context-usage-mcp)",
     "subagent_definitions": "var(--context-usage-subagents)",
     "memory": "var(--context-usage-memory)",
+    "unclassified_prompt": "var(--context-usage-system)",
     "conversation": "var(--context-usage-conversation)",
 }
 
@@ -62,22 +61,6 @@ def _split_tools(tools: Sequence[dict]) -> Tuple[List[dict], List[dict], List[di
     return builtin, mcp, subagent
 
 
-def _memory_blocks(agent: Any) -> Tuple[str, str]:
-    memory_block = ""
-    user_block = ""
-    store = getattr(agent, "_memory_store", None)
-    if store is None:
-        return memory_block, user_block
-    try:
-        if getattr(agent, "_memory_enabled", True):
-            memory_block = store.format_for_system_prompt("memory") or ""
-        if getattr(agent, "_user_profile_enabled", True):
-            user_block = store.format_for_system_prompt("user") or ""
-    except Exception:
-        pass
-    return memory_block, user_block
-
-
 def _strip_blocks(text: str, *blocks: str) -> str:
     out = text
     for block in blocks:
@@ -92,22 +75,45 @@ def compute_session_context_breakdown(
 ) -> Dict[str, Any]:
     """Return a Cursor-style context usage breakdown for one live agent."""
     from agent.model_metadata import estimate_messages_tokens_rough
-    from agent.system_prompt import build_system_prompt_parts
+    cached_prompt = getattr(agent, "_cached_system_prompt", None)
+    unclassified_prompt = ""
+    if isinstance(cached_prompt, str) and cached_prompt:
+        # Report the prompt generation that actually governs this live
+        # session. Rebuilding here would consult current policy/context files
+        # and could describe a newer generation than the cached prompt (or
+        # fail after an on-disk edit) without changing model behavior.
+        from agent.system_prompt import extract_prompt_layout_snapshot
 
-    parts = build_system_prompt_parts(agent)
-    stable = parts.get("stable", "") or ""
-    context = parts.get("context", "") or ""
-    volatile = parts.get("volatile", "") or ""
+        frozen_parts = extract_prompt_layout_snapshot(cached_prompt)
+        if frozen_parts is not None:
+            stable = frozen_parts["stable"]
+            context = frozen_parts["context"]
+            volatile = frozen_parts["volatile"]
+            skills_index = frozen_parts["volatile_skills"]
+            memory_text = frozen_parts["volatile_memory"]
+            volatile_system = frozen_parts["volatile_other"]
+        else:
+            stable = ""
+            context = ""
+            volatile = ""
+            skills_index = ""
+            memory_text = ""
+            volatile_system = ""
+            unclassified_prompt = cached_prompt
+    else:
+        from agent.system_prompt import build_system_prompt_parts
 
-    skills_match = _SKILLS_BLOCK_RE.search(stable)
-    skills_index = skills_match.group(0) if skills_match else ""
+        parts = build_system_prompt_parts(agent)
+        stable = parts.get("stable", "") or ""
+        context = parts.get("context", "") or ""
+        volatile = parts.get("volatile", "") or ""
+        skills_index = parts.get("volatile_skills", "") or ""
+        memory_text = parts.get("volatile_memory", "") or ""
+        volatile_system = parts.get("volatile_other", "") or ""
 
-    memory_block, user_block = _memory_blocks(agent)
-    memory_text = "\n\n".join(part for part in (memory_block, user_block) if part).strip()
-
-    system_core = _strip_blocks(stable, skills_index)
-    system_tail = _strip_blocks(volatile, memory_block, user_block)
-    system_prompt_text = "\n\n".join(part for part in (system_core, system_tail) if part).strip()
+    system_prompt_text = "\n\n".join(
+        part for part in (stable, volatile_system) if part
+    ).strip()
 
     tools = list(getattr(agent, "tools", None) or [])
     builtin_tools, mcp_tools, subagent_tools = _split_tools(tools)
@@ -122,6 +128,11 @@ def compute_session_context_breakdown(
         ("mcp", "MCP", _json_tokens(mcp_tools)),
         ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
         ("memory", "Memory", _chars_to_tokens(memory_text)),
+        (
+            "unclassified_prompt",
+            "Unclassified prompt",
+            _chars_to_tokens(unclassified_prompt),
+        ),
         ("conversation", "Conversation", conversation_tokens),
     ]
 

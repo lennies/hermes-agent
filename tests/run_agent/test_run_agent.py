@@ -3025,6 +3025,41 @@ class TestRunConversation:
         coordinator.release_conversation.assert_called_once_with(relay_lease)
         assert agent._relay_pending_turn_id is None
 
+    def test_completed_turn_restores_auxiliary_policy_scope(self, agent):
+        from agent.auxiliary_client import (
+            call_llm,
+            set_runtime_trusted_policy_block,
+        )
+
+        turn_result = {
+            "final_response": "done",
+            "messages": [],
+            "completed": True,
+        }
+
+        def fake_turn(*_args, **_kwargs):
+            set_runtime_trusted_policy_block("FROZEN TURN POLICY")
+            return turn_result
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        with (
+            patch("agent.conversation_loop.run_conversation", side_effect=fake_turn),
+            patch(
+                "agent.prompt_builder.load_global_instructions_file",
+                return_value=None,
+            ) as loader,
+            patch(
+                "agent.auxiliary_client._call_llm_impl",
+                return_value=response,
+            ),
+        ):
+            assert agent.run_conversation("hello") is turn_result
+            call_llm(messages=[{"role": "user", "content": "standalone"}])
+
+        loader.assert_called_once()
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")

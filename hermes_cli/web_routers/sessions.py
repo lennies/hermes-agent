@@ -765,7 +765,12 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             sid = db.resolve_session_id(session_id)
-            return (sid, db.get_session(sid)) if sid else None
+            if not sid:
+                return None
+            session = db.get_session(sid)
+            if session is None:
+                return None
+            return sid, db.portable_session_metadata(session)
         finally:
             db.close()
 

@@ -606,6 +606,14 @@ def _egress_reuse_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+_HOST_CONTEXT_LABEL_KEY = "hermes-host-context"
+
+
+def _host_context_reuse_posture(include_host_context: bool) -> str:
+    """Return the immutable reuse label for host-mounted context posture."""
+    return "included" if include_host_context else "excluded"
+
+
 def _egress_enforce_on_docker(default: bool = True) -> bool:
     """Read proxy.enforce_on_docker with fail-safe defaulting."""
     try:
@@ -919,6 +927,7 @@ class DockerEnvironment(BaseEnvironment):
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
+        include_host_context: bool = True,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -932,6 +941,7 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        self._include_host_context = include_host_context
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
@@ -1045,6 +1055,8 @@ class DockerEnvironment(BaseEnvironment):
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
         try:
+            if not self._include_host_context:
+                raise ImportError("host context disabled for this environment")
             from tools.credential_files import (
                 get_credential_file_mounts,
                 get_skills_directory_mount,
@@ -1126,12 +1138,16 @@ class DockerEnvironment(BaseEnvironment):
         # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
         # env vars so outbound traffic routes through the host-side proxy.
         # The sandbox receives PROXY tokens instead of real API keys.
-        egress_volume_args, egress_env_overrides, egress_host_args = (
-            _egress_proxy_args_for_docker()
-        )
+        if self._include_host_context:
+            egress_volume_args, egress_env_overrides, egress_host_args = (
+                _egress_proxy_args_for_docker()
+            )
+        else:
+            egress_volume_args, egress_env_overrides, egress_host_args = [], {}, []
         egress_label = _egress_reuse_fingerprint(
             egress_volume_args, egress_env_overrides, egress_host_args,
         )
+        host_context_label = _host_context_reuse_posture(self._include_host_context)
         _enforce_egress = _egress_enforce_on_docker()
         _critical_egress_names = _critical_egress_env_names(egress_env_overrides)
         if egress_env_overrides:
@@ -1409,6 +1425,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_HOST_CONTEXT_LABEL_KEY}={host_context_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1421,6 +1438,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _HOST_CONTEXT_LABEL_KEY: host_context_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1437,7 +1455,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, host_context_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1581,6 +1599,8 @@ class DockerEnvironment(BaseEnvironment):
 
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """Return forwarded values and scoped names that must be unset."""
+        if not getattr(self, "_include_host_context", True):
+            return {}, set()
         exec_env: dict[str, str] = {}
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
@@ -1697,7 +1717,13 @@ class DockerEnvironment(BaseEnvironment):
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
-            task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            task_label,
+            profile_label,
+            self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(
+                _HOST_CONTEXT_LABEL_KEY,
+                _host_context_reuse_posture(self._include_host_context),
+            ),
         )
         if existing is not None:
             cid, state = existing
@@ -1862,6 +1888,7 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
+        host_context_label: str,
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -1880,6 +1907,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_HOST_CONTEXT_LABEL_KEY}={host_context_label}",
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])

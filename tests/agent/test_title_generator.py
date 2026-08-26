@@ -1,9 +1,18 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
+import threading
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock, patch
 
 
+from agent.auxiliary_client import (
+    bind_runtime_trusted_policy_from_prompt,
+    call_llm,
+    reset_runtime_trusted_policy_block,
+)
+from agent.prompt_builder import LoadedGlobalInstructions, render_trusted_policy_prefix
 from agent.title_generator import (
     generate_title,
     auto_title_session,
@@ -289,6 +298,60 @@ class TestMaybeAutoTitle:
                 title_callback=None,
                 runtime_validator=None,
             )
+
+    def test_daemon_thread_inherits_frozen_session_policy_across_host_drift(self):
+        """The title call keeps the turn's session snapshot, not current disk."""
+        frozen = LoadedGlobalInstructions(
+            content="Frozen session policy.",
+            resolved_path=Path("/frozen/AGENTS.md"),
+            sha256="a" * 64,
+        )
+        drifted = LoadedGlobalInstructions(
+            content="Drifted host policy.",
+            resolved_path=Path("/drifted/AGENTS.md"),
+            sha256="b" * 64,
+        )
+        token = bind_runtime_trusted_policy_from_prompt(
+            render_trusted_policy_prefix("Identity", frozen)
+        )
+        completed = threading.Event()
+        worker_error = []
+
+        def title_worker(*_args, **_kwargs):
+            try:
+                call_llm(messages=[{"role": "user", "content": "name this"}])
+            except BaseException as exc:  # surfaced on the parent test thread
+                worker_error.append(exc)
+            finally:
+                completed.set()
+
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "Title"
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        try:
+            with (
+                patch("agent.title_generator.auto_title_session", side_effect=title_worker),
+                patch(
+                    "agent.prompt_builder.load_global_instructions_file",
+                    return_value=drifted,
+                ) as loader,
+                patch(
+                    "agent.auxiliary_client._call_llm_impl",
+                    return_value=response,
+                ) as impl,
+            ):
+                maybe_auto_title(db, "sess-1", "hello", [])
+                assert completed.wait(timeout=10), "auto-title thread never completed"
+        finally:
+            reset_runtime_trusted_policy_block(token)
+
+        assert not worker_error
+        loader.assert_not_called()
+        sent = impl.call_args.kwargs["messages"]
+        assert "Frozen session policy." in sent[0]["content"]
+        assert "Drifted host policy." not in sent[0]["content"]
 
     def test_writes_instant_title_before_the_model_runs(self, tmp_path):
         """The derived title lands synchronously — no LLM, no waiting."""

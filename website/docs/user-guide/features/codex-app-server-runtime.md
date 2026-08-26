@@ -21,6 +21,29 @@ Not using OpenAI Codex? `hermes setup --portal` configures a non-Codex backend w
 - **Hermes' richer tools come along** — web_search, web_extract, browser automation, vision, image generation, skills, and TTS work via an MCP callback. Codex calls back into Hermes for tools it doesn't have built in.
 - **Memory and skill nudges keep working** — Codex's events are projected into Hermes' message shape so the self-improvement loop sees a normal-looking transcript.
 
+## Trusted host policy handoff
+
+When Hermes has a configured global instructions file, a new Codex thread
+receives exactly the frozen `# Trusted Host Policy` block from the Hermes
+session snapshot as Codex developer instructions. The block includes its
+resolved source path and original-byte SHA-256 provenance. Hermes does not pass
+its broader system prompt, tool guidance, memory, or project context through
+this field.
+
+The handoff happens once at `thread/start`. Existing Codex threads are not
+hot-updated, and restored Hermes sessions continue using the policy bytes
+frozen in their stored prompt even if the live file has since changed. With no
+verified policy snapshot, Hermes omits the developer-instructions field.
+Hermes never reads or promotes cwd-effective Codex configuration into this
+field. Codex's host-owned user configuration and plugins remain available, but
+Hermes marks the cwd and every possible ancestor project root untrusted at CLI
+precedence. This prevents lower-trust project `.codex/config.toml` files from
+starting executable MCP servers or hooks outside Hermes' approval boundary.
+Hermes also pins sandbox mode, approval policy, inherited environment,
+writable roots, and network access at process construction so project config
+cannot widen them. A thread-start rejection fails the session visibly instead
+of silently dropping the host policy.
+
 ## What tools the model actually has
 
 This is the part most users want to know up front. When this runtime is on, the model running your turn has three independent sources of tools:

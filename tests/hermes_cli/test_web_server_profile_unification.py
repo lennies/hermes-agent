@@ -60,6 +60,57 @@ def _write_jobs(home, jobs):
 
 class TestProfileScopedConfig:
 
+    def test_named_profile_reports_shared_policy_without_persisting_it(
+        self, client, isolated_profiles
+    ):
+        policy = isolated_profiles["default"].parent / "POLICY.md"
+        policy.write_text("host policy", encoding="utf-8")
+        (isolated_profiles["default"] / "config.yaml").write_text(
+            yaml.safe_dump({"global_instructions_file": str(policy)}),
+            encoding="utf-8",
+        )
+
+        record = client.get(
+            "/api/config", params={"profile": "worker_beta"}
+        ).json()
+        assert record["global_instructions_file"] == str(policy)
+        schema = client.get(
+            "/api/config/schema", params={"profile": "worker_beta"}
+        ).json()["fields"]
+        assert schema["global_instructions_file"]["readOnly"] is True
+        assert schema["global_instructions_file"]["scope"] == "host-global"
+
+        record["timezone"] = "Pluto/Far"
+        response = client.put(
+            "/api/config?profile=worker_beta", json={"config": record}
+        )
+        assert response.status_code == 200
+        worker = _cfg(isolated_profiles["worker_beta"])
+        assert worker["timezone"] == "Pluto/Far"
+        assert "global_instructions_file" not in worker
+
+    def test_named_profile_rejects_policy_change_and_raw_copy(
+        self, client, isolated_profiles
+    ):
+        response = client.put(
+            "/api/config?profile=worker_beta",
+            json={"config": {"global_instructions_file": "/tmp/other-policy"}},
+        )
+        assert response.status_code == 400
+        assert "host-global" in response.json()["detail"]
+
+        raw = client.put(
+            "/api/config/raw?profile=worker_beta",
+            json={
+                "yaml_text": "global_instructions_file: /tmp/legacy\n",
+            },
+        )
+        assert raw.status_code == 400
+        assert "host-global" in raw.json()["detail"]
+        assert "global_instructions_file" not in _cfg(
+            isolated_profiles["worker_beta"]
+        )
+
 
     def test_config_query_param_equivalent_to_body(self, client, isolated_profiles):
         """The SPA's fetchJSON injects ?profile= — must scope like body.profile."""

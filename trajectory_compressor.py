@@ -630,6 +630,15 @@ TURNS TO SUMMARIZE:
 
 Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
+        direct_messages = None
+        from agent.prompt_builder import GlobalInstructionsError
+        if not getattr(self, '_use_call_llm', False):
+            from agent.auxiliary_client import _auxiliary_messages_with_trusted_policy
+
+            direct_messages = _auxiliary_messages_with_trusted_policy(
+                [{"role": "user", "content": prompt}]
+            )
+
         for attempt in range(self.config.max_retries):
             try:
                 metrics.summarization_api_calls += 1
@@ -651,7 +660,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 else:
                     _create_kwargs = {
                         "model": self.config.summarization_model,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": direct_messages,
                         "max_tokens": self.config.summary_target_tokens * 2,
                     }
                     if summary_temperature is not None:
@@ -661,6 +670,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
+            except GlobalInstructionsError:
+                raise
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
@@ -699,6 +710,15 @@ TURNS TO SUMMARIZE:
 
 Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
+        direct_messages = None
+        from agent.prompt_builder import GlobalInstructionsError
+        if not getattr(self, '_use_call_llm', False):
+            from agent.auxiliary_client import _auxiliary_messages_with_trusted_policy
+
+            direct_messages = _auxiliary_messages_with_trusted_policy(
+                [{"role": "user", "content": prompt}]
+            )
+
         for attempt in range(self.config.max_retries):
             try:
                 metrics.summarization_api_calls += 1
@@ -720,7 +740,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 else:
                     _create_kwargs = {
                         "model": self.config.summarization_model,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": direct_messages,
                         "max_tokens": self.config.summary_target_tokens * 2,
                     }
                     if summary_temperature is not None:
@@ -730,6 +750,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
+            except GlobalInstructionsError:
+                raise
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)

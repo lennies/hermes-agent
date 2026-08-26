@@ -8,7 +8,11 @@ compatible with batch_runner.py and trajectory_compressor.py.
 
 Features:
 - Uses Hermes-Agent's Docker, Modal, or Local environments for command execution
+- Freezes configured global instructions into the model-only prompt per task
+- Describes whether terminal execution is on-host or isolated/remote
+- Creates Docker/Modal tasks without host credentials, skills, caches, or shared snapshots
 - Outputs trajectories in Hermes format (from/value pairs with <tool_call>/<tool_response> XML)
+- Redacts policy content from portable trajectories while recording its SHA-256 generation
 - Compatible with the trajectory compression pipeline
 - Supports batch processing from JSONL prompt files
 
@@ -34,6 +38,10 @@ from typing import List, Dict, Any, Optional
 
 import fire
 from dotenv import load_dotenv
+from agent.prompt_builder import (
+    GlobalInstructionsError,
+    load_global_instructions_file,
+)
 from agent.tool_dispatch_helpers import make_tool_result_message
 
 # Load environment variables
@@ -72,7 +80,8 @@ TERMINAL_TOOL_DEFINITION = {
         "description": """Execute bash commands in a sandboxed environment.
 
 **Environment:**
-- Isolated execution environment (local, Docker, or Modal cloud)
+- Task-selected local, Docker, or Modal environment
+- The system message states whether this task runs on-host or isolated/remote
 - Filesystem persists between tool calls within the same task
 - Internet access available
 
@@ -108,6 +117,42 @@ TERMINAL_TOOL_DEFINITION = {
         }
     }
 }
+
+_MINI_SWE_TOOL_LOOP_INSTRUCTIONS = """You are an AI agent that can execute bash commands to complete tasks.
+
+When you need to run commands, use the 'terminal' tool with your bash command.
+
+**Important:**
+- When you have completed the task successfully, run: echo "MINI_SWE_AGENT_FINAL_OUTPUT" followed by a summary
+- Be concise and efficient in your approach
+- Install any needed tools with apt-get or pip
+- Avoid interactive commands (no vim, nano, less, etc.)
+
+Complete the user's task step by step."""
+
+
+def _execution_boundary_prompt(env_type: str) -> str:
+    """Describe where Mini-SWE terminal commands execute for this task."""
+    if env_type == "local":
+        return (
+            "# Execution Boundary\n\n"
+            "The Mini-SWE terminal executes directly on the local host surface. "
+            "Treat its filesystem and credentials as host-local resources and use "
+            "only access authorized by the task."
+        )
+    if env_type in {"docker", "modal"}:
+        environment = "Docker" if env_type == "docker" else "Modal"
+        location = "isolated" if env_type == "docker" else "remote"
+        return (
+            "# Execution Boundary\n\n"
+            f"The terminal executes in a {location} {environment} environment, "
+            "not on the host surface. It does not inherit the host filesystem or "
+            "credentials. Any Trusted Host Policy above governs agent decisions "
+            "but is not copied or mounted into the terminal environment."
+        )
+    raise ValueError(
+        f"Unknown environment type: {env_type}. Use 'local', 'docker', or 'modal'"
+    )
 
 
 # ============================================================================
@@ -237,13 +282,43 @@ class MiniSWERunner:
     def _create_env(self):
         """Create the execution environment."""
         print(f"🔧 Creating {self.env_type} environment...")
+        remote_isolation = {}
+        if self.env_type == "docker":
+            remote_isolation = {
+                "include_host_context": False,
+                "persist_across_processes": False,
+                "persistent_filesystem": False,
+            }
+        elif self.env_type == "modal":
+            remote_isolation = {
+                "include_host_context": False,
+                "persistent_filesystem": False,
+            }
         self.env = create_environment(
             env_type=self.env_type,
             image=self.image,
             cwd=self.cwd,
-            timeout=self.command_timeout
+            timeout=self.command_timeout,
+            **remote_isolation,
         )
         print("✅ Environment ready")
+
+    def _build_task_system_prompt(self) -> tuple[str, Optional[str]]:
+        """Freeze policy and execution guidance for one task loop."""
+        global_instructions = load_global_instructions_file()
+        parts = []
+        if global_instructions is not None:
+            parts.append(global_instructions.prompt_block().strip())
+        parts.extend(
+            [
+                _execution_boundary_prompt(self.env_type),
+                _MINI_SWE_TOOL_LOOP_INSTRUCTIONS,
+            ]
+        )
+        return (
+            "\n\n".join(parts),
+            global_instructions.sha256 if global_instructions is not None else None,
+        )
     
     def _cleanup_env(self):
         """Cleanup the execution environment."""
@@ -299,7 +374,8 @@ class MiniSWERunner:
         self,
         messages: List[Dict[str, Any]],
         user_query: str,
-        completed: bool
+        completed: bool,
+        policy_sha256: Optional[str],
     ) -> List[Dict[str, Any]]:
         """
         Convert internal message format to Hermes trajectory format.
@@ -309,7 +385,18 @@ class MiniSWERunner:
         trajectory = []
         
         # System message with tool definitions
+        policy_record = (
+            "# Trusted Host Policy (portable record)\n\n"
+            "The host-policy content applied to this task is intentionally "
+            "omitted from the portable trajectory.\n"
+            f"SHA-256: {policy_sha256}"
+            if policy_sha256
+            else "# Trusted Host Policy (portable record)\n\nNot configured for this task."
+        )
         system_msg = (
+            f"{policy_record}\n\n"
+            f"{_execution_boundary_prompt(self.env_type)}\n\n"
+            f"{_MINI_SWE_TOOL_LOOP_INSTRUCTIONS}\n\n"
             "You are a function calling AI model. You are provided with function signatures within <tools> </tools> XML tags. "
             "You may call one or more functions to assist with the user query. If available tools are not relevant in assisting "
             "with user query, just respond in natural conversational language. Don't make assumptions about what values to plug "
@@ -418,25 +505,16 @@ class MiniSWERunner:
         print(f"\n{'='*60}")
         print(f"📝 Task: {task[:80]}{'...' if len(task) > 80 else ''}")
         print(f"{'='*60}")
+
+        # Freeze the task's model-only policy before any environment or API
+        # side effect. The prompt is reused byte-for-byte for every iteration.
+        system_prompt, policy_sha256 = self._build_task_system_prompt()
         
         # Initialize environment
         self._create_env()
         
         # Message history
         messages = [{"role": "user", "content": task}]
-        
-        # System prompt for the LLM (ephemeral - not saved to trajectory)
-        system_prompt = """You are an AI agent that can execute bash commands to complete tasks.
-
-When you need to run commands, use the 'terminal' tool with your bash command.
-
-**Important:**
-- When you have completed the task successfully, run: echo "MINI_SWE_AGENT_FINAL_OUTPUT" followed by a summary
-- Be concise and efficient in your approach
-- Install any needed tools with apt-get or pip
-- Avoid interactive commands (no vim, nano, less, etc.)
-
-Complete the user's task step by step."""
         
         api_call_count = 0
         completed = False
@@ -557,7 +635,9 @@ Complete the user's task step by step."""
             self._cleanup_env()
         
         # Convert to Hermes trajectory format
-        trajectory = self._convert_to_hermes_format(messages, task, completed)
+        trajectory = self._convert_to_hermes_format(
+            messages, task, completed, policy_sha256
+        )
         
         return {
             "conversations": trajectory,
@@ -566,6 +646,8 @@ Complete the user's task step by step."""
             "metadata": {
                 "model": self.model,
                 "env_type": self.env_type,
+                "trusted_policy_present": policy_sha256 is not None,
+                "trusted_policy_sha256": policy_sha256,
                 "timestamp": datetime.now().isoformat()
             }
         }
@@ -606,6 +688,10 @@ Complete the user's task step by step."""
                     
                     print(f"✅ Task {i} completed (api_calls={result['api_calls']})")
                     
+                except GlobalInstructionsError:
+                    # Host-policy failures are fail-closed task setup errors,
+                    # not trajectory data. Do not serialize their source path.
+                    raise
                 except Exception as e:
                     self.logger.error("Error on task %s: %s", i, e)
                     error_result = {

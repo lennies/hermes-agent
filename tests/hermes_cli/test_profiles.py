@@ -151,6 +151,29 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_does_not_copy_host_global_instruction_setting(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model: test\nglobal_instructions_file: /host/policy.md\n",
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        cloned = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert "global_instructions_file" not in cloned
+
+    def test_clone_all_does_not_copy_host_global_instruction_setting(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "global_instructions_file: /host/policy.md\n", encoding="utf-8"
+        )
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        cloned = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert "global_instructions_file" not in cloned
+
 
 
 
@@ -759,6 +782,39 @@ class TestExportImport:
         assert "default/SOUL.md" in names
         assert "default/memories/MEMORY.md" in names
 
+    def test_export_strips_host_global_instruction_setting(self, profile_env, tmp_path):
+        default_dir = get_profile_dir("default")
+        (default_dir / "config.yaml").write_text(
+            "model: test\nglobal_instructions_file: /host/policy.md\n",
+            encoding="utf-8",
+        )
+        output = tmp_path / "default.tar.gz"
+
+        export_profile("default", str(output))
+
+        with tarfile.open(output, "r:gz") as tf:
+            exported = yaml.safe_load(
+                tf.extractfile("default/config.yaml").read().decode("utf-8")
+            )
+        assert "global_instructions_file" not in exported
+
+    def test_import_strips_host_global_instruction_setting(self, profile_env, tmp_path):
+        staged = tmp_path / "staged"
+        source = staged / "shared"
+        source.mkdir(parents=True)
+        (source / "config.yaml").write_text(
+            "model: test\nglobal_instructions_file: /host/policy.md\n",
+            encoding="utf-8",
+        )
+        archive = tmp_path / "shared.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(source, arcname="shared")
+
+        imported_dir = import_profile(str(archive), name="imported")
+
+        imported = yaml.safe_load((imported_dir / "config.yaml").read_text())
+        assert "global_instructions_file" not in imported
+
 
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
         """Broken symlinks inside allowed artifacts are preserved, not crashed (#58394).
@@ -1135,5 +1191,3 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
-

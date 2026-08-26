@@ -210,6 +210,17 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_turn_binds_auxiliary_calls_to_selected_cached_policy_snapshot():
+    agent = _FakeAgent()
+
+    with patch(
+        "agent.auxiliary_client.bind_runtime_trusted_policy_from_prompt"
+    ) as bind_policy:
+        _build(agent)
+
+    bind_policy.assert_called_once_with("SYSTEM", active_home=None)
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

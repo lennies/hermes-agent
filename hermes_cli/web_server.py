@@ -67,10 +67,12 @@ from hermes_cli.config import (
     get_env_path,
     get_hermes_home,
     get_process_hermes_home,
+    global_instructions_uses_named_profile,
     load_config,
     load_env,
     read_raw_config,
     resolve_cron_model_drift_defaults,
+    resolve_global_instructions_file,
     save_config,
     save_env_value,
     remove_env_value,
@@ -7144,7 +7146,17 @@ async def get_config(profile: Optional[str] = None):
     # override stays scoped to the worker thread.
     def _run():
         with _profile_scope(profile):
-            return _normalize_config_for_web(load_config())
+            config = _normalize_config_for_web(load_config())
+            if global_instructions_uses_named_profile():
+                from hermes_constants import get_default_hermes_root
+
+                effective = resolve_global_instructions_file(
+                    active_home=get_default_hermes_root()
+                )
+                config["global_instructions_file"] = (
+                    str(effective) if effective is not None else ""
+                )
+            return config
 
     config = await asyncio.to_thread(_run)
     # Strip internal keys that the frontend shouldn't see or send back
@@ -7163,6 +7175,15 @@ async def get_schema(profile: Optional[str] = None):
     # start still show up, scoped to the requested profile's config.
     with _config_profile_scope(profile):
         fields = _schema_with_dynamic_provider_options()
+        if global_instructions_uses_named_profile():
+            fields = dict(fields)
+            entry = fields.get("global_instructions_file")
+            if isinstance(entry, dict):
+                fields["global_instructions_file"] = {
+                    **entry,
+                    "readOnly": True,
+                    "scope": "host-global",
+                }
     return {"fields": fields, "category_order": _CATEGORY_ORDER}
 
 
@@ -7988,6 +8009,30 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             with _CONFIG_MUTATION_LOCK:
                 existing = read_raw_config()
                 incoming = _denormalize_config_from_web(body.config)
+                named_profile = global_instructions_uses_named_profile()
+                if named_profile and "global_instructions_file" in incoming:
+                    from hermes_constants import get_default_hermes_root
+
+                    effective = resolve_global_instructions_file(
+                        active_home=get_default_hermes_root()
+                    )
+                    effective_value = str(effective) if effective is not None else ""
+                    if incoming["global_instructions_file"] != effective_value:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "global_instructions_file is host-global and "
+                                "cannot be changed from a named profile"
+                            ),
+                        )
+                    # Full dashboard round-trips include read-only fields. Do
+                    # not manufacture the host-global key in the profile file.
+                    incoming.pop("global_instructions_file")
+                if named_profile:
+                    # Also repair legacy/broken local copies on any successful
+                    # schema-driven save. The raw editor remains an explicit
+                    # recovery surface as well.
+                    existing.pop("global_instructions_file", None)
                 merged = _deep_merge(existing, incoming)
                 # Compare normalized approvals.mode across the in-memory
                 # documents, not config blocks and not cache re-reads: the
@@ -15654,6 +15699,17 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
             raise HTTPException(status_code=400, detail="YAML must be a mapping")
         approvals_mode_changed = False
         with _profile_scope(body.profile or profile):
+            if (
+                global_instructions_uses_named_profile()
+                and "global_instructions_file" in parsed
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "global_instructions_file is host-global and may not "
+                        "appear in a named-profile config"
+                    ),
+                )
             # Full-document replacement: the editor owns the whole file; do not
             # merge omitted sections back from disk (#62723).
             approvals_mode_changed = _approval_mode_of(parsed) != _approval_mode_of(read_raw_config())

@@ -18,9 +18,12 @@ import logging
 import os
 import shlex
 from pathlib import Path
-from typing import Dict, Any, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 
-from agent.prompt_builder import _scan_context_content
+from agent.prompt_builder import (
+    _scan_context_content,
+    extract_trusted_policy_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +62,6 @@ _EXCLUDED_DIR_NAMES = frozenset({
     "vendor", "third_party",
 })
 
-
 def _is_ancestor_or_same(a: Path, b: Path) -> bool:
     """Check if *a* is the same as or an ancestor of *b* (parent directory check)."""
     try:
@@ -82,15 +84,30 @@ class SubdirectoryHintTracker:
             tool_result += hints  # append to the tool result string
     """
 
-    def __init__(self, working_dir: Optional[str] = None):
+    def __init__(
+        self,
+        working_dir: Optional[str] = None,
+        *,
+        prompt_provider: Optional[Callable[[], Optional[str]]] = None,
+        enabled: bool = True,
+    ):
+        self.enabled = bool(enabled)
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
         self._loaded_dirs: Set[Path] = set()
+        self._loaded_resolved_paths: Set[Path] = set()
+        self._startup_resolved_paths: Set[Path] = set()
+        self._excluded_resolved_paths: Set[Path] = set()
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
         self._loaded_digests: Set[str] = set()
+        self._startup_digests: Set[str] = set()
+        self._excluded_digests: Set[str] = set()
+        self._prompt_provider = prompt_provider
+        self._prompt_exclusions_seeded = False
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
-        self._seed_working_dir_digest()
+        if self.enabled:
+            self._seed_working_dir_digest()
 
     def _seed_working_dir_digest(self) -> None:
         """Record the CWD context file's digest so it is never re-injected.
@@ -100,19 +117,61 @@ class SubdirectoryHintTracker:
         a different path (a symlink farm, a shared workspace) is recognised as a
         duplicate instead of being sent a second time.
         """
+        if not self.enabled:
+            return
+        self._startup_resolved_paths.clear()
+        self._startup_digests.clear()
         for filename in _HINT_FILENAMES:
             candidate = self.working_dir / filename
             try:
                 if not candidate.is_file():
                     continue
-                content = candidate.read_text(encoding="utf-8").strip()
+                resolved = candidate.resolve(strict=True)
+                raw = resolved.read_bytes()
+                content = raw.decode("utf-8").strip()
             except (OSError, UnicodeDecodeError):
                 continue
-            if content:
-                self._loaded_digests.add(
-                    hashlib.sha256(content.encode("utf-8")).hexdigest()
-                )
-            break  # first match wins, mirroring startup loading
+            if not content:
+                continue
+            digest = hashlib.sha256(raw).hexdigest()
+            if (
+                resolved in self._excluded_resolved_paths
+                or digest in self._excluded_digests
+            ):
+                # An excluded override falls through to the next candidate,
+                # exactly like startup prompt assembly.
+                continue
+            self._startup_resolved_paths.add(resolved)
+            self._startup_digests.add(digest)
+            break  # first effective match wins, mirroring startup loading
+
+    def seed_exclusions_from_prompt_snapshot(self, prompt: str) -> None:
+        """Replace exclusions from one verified byte-zero prompt snapshot."""
+        if not self.enabled:
+            return
+        snapshot = extract_trusted_policy_snapshot(prompt)
+        self._excluded_resolved_paths = (
+            {snapshot.resolved_path} if snapshot is not None else set()
+        )
+        self._excluded_digests = (
+            {snapshot.source_sha256} if snapshot is not None else set()
+        )
+        self._prompt_exclusions_seeded = True
+        self._seed_working_dir_digest()
+
+    def _seed_exclusions_from_cached_prompt(self) -> None:
+        """Recover trusted-source provenance for restored/forked snapshots.
+
+        Restore and fork paths can reuse a cached prompt without rebuilding it,
+        so this recovers only the verified provenance frozen into that snapshot;
+        it never rereads current config or hot-reloads the policy.
+        """
+        if self._prompt_exclusions_seeded or self._prompt_provider is None:
+            return
+        prompt = self._prompt_provider()
+        if not prompt:
+            return
+        self.seed_exclusions_from_prompt_snapshot(prompt)
 
     def check_tool_call(
         self,
@@ -123,6 +182,9 @@ class SubdirectoryHintTracker:
 
         Returns formatted hint text to append to the tool result, or None.
         """
+        if not self.enabled:
+            return None
+        self._seed_exclusions_from_cached_prompt()
         dirs = self._extract_directories(tool_name, tool_args)
         if not dirs:
             return None
@@ -258,6 +320,8 @@ class SubdirectoryHintTracker:
 
         Only loads hints from directories within the working directory tree.
         """
+        if not self.enabled:
+            return None
         self._loaded_dirs.add(directory)
 
         # Reject paths outside the working directory tree.
@@ -285,21 +349,39 @@ class SubdirectoryHintTracker:
             except OSError:
                 continue
             try:
-                content = hint_path.read_text(encoding="utf-8").strip()
+                resolved = hint_path.resolve(strict=True)
+                if resolved in self._excluded_resolved_paths:
+                    logger.debug("Skipping excluded hint source at %s", hint_path)
+                    continue
+                if resolved in (
+                    self._loaded_resolved_paths | self._startup_resolved_paths
+                ):
+                    logger.debug("Skipping duplicate hint source at %s", hint_path)
+                    break
+                raw = resolved.read_bytes()
+                content = raw.decode("utf-8").strip()
                 if not content:
                     continue
                 # Skip content we've already injected. The same AGENTS.md is
                 # routinely reachable through several paths (symlinked shared
                 # workspaces, hardlinks, copied backups); re-sending it burns
                 # context for zero new information.
-                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                if digest in self._loaded_digests:
+                digest = hashlib.sha256(raw).hexdigest()
+                if digest in self._excluded_digests:
+                    logger.debug(
+                        "Skipping excluded hint content at %s (digest %s)",
+                        hint_path,
+                        digest[:12],
+                    )
+                    continue
+                if digest in (self._loaded_digests | self._startup_digests):
                     logger.debug(
                         "Skipping duplicate hint content at %s (digest %s)",
                         hint_path,
                         digest[:12],
                     )
                     break
+                self._loaded_resolved_paths.add(resolved)
                 self._loaded_digests.add(digest)
                 # Same security scan as startup context loading
                 content = _scan_context_content(content, filename)
