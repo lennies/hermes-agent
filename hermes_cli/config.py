@@ -3325,6 +3325,111 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+class GlobalInstructionsConfigError(RuntimeError):
+    """The host-global instructions setting is invalid or misplaced."""
+
+
+def global_instructions_uses_named_profile(
+    active_home: Optional[Path] = None,
+) -> bool:
+    """Return whether *active_home* is outside the default Hermes root."""
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    root = get_default_hermes_root()
+    current_home = Path(active_home) if active_home is not None else get_hermes_home()
+    try:
+        return current_home.resolve() != root.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise GlobalInstructionsConfigError(
+            f"Cannot resolve the active Hermes home for global instructions: {exc}"
+        ) from exc
+
+
+def _read_global_instructions_root_config(config_path: Path) -> Dict[str, Any]:
+    """Read the default-root config without normalizing an invalid YAML root."""
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    if not raw.strip():
+        return {}
+
+    data = fast_safe_load(raw)
+    if not isinstance(data, dict):
+        raise GlobalInstructionsConfigError(
+            f"Default-root config {config_path} must contain a YAML mapping"
+        )
+    return data
+
+
+def resolve_global_instructions_file(
+    *, active_home: Optional[Path] = None
+) -> Optional[Path]:
+    """Resolve ``global_instructions_file`` from the default Hermes root.
+
+    This is the one deliberate exception to profile config isolation: a host
+    policy governs every local profile. Named profiles may not contain the key,
+    even with an empty value, because accepting it would make profile exports
+    and clones capable of changing host policy resolution.
+    """
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    root = get_default_hermes_root()
+    current_home = Path(active_home) if active_home is not None else get_hermes_home()
+    is_named_profile = global_instructions_uses_named_profile(current_home)
+
+    if is_named_profile:
+        profile_config_path = current_home / "config.yaml"
+        try:
+            profile_config = read_user_config_raw(profile_config_path)
+        except Exception as exc:
+            raise GlobalInstructionsConfigError(
+                f"Cannot read named-profile config {profile_config_path}: {exc}"
+            ) from exc
+        if "global_instructions_file" in profile_config:
+            raise GlobalInstructionsConfigError(
+                "global_instructions_file is host-global and may only appear in "
+                f"{root / 'config.yaml'}; remove it from {profile_config_path}"
+            )
+
+    root_config_path = root / "config.yaml"
+    try:
+        root_config = _read_global_instructions_root_config(root_config_path)
+    except GlobalInstructionsConfigError:
+        raise
+    except Exception as exc:
+        raise GlobalInstructionsConfigError(
+            f"Cannot read default-root config {root_config_path}: {exc}"
+        ) from exc
+
+    value = root_config.get("global_instructions_file", "")
+    if not isinstance(value, str):
+        raise GlobalInstructionsConfigError(
+            "global_instructions_file must be a string containing an absolute "
+            "path (or ~/ path), or an empty string to disable it"
+        )
+    value = value.strip()
+    if not value:
+        return None
+    if "${" in value:
+        raise GlobalInstructionsConfigError(
+            "global_instructions_file is a literal path and does not support "
+            "${...} environment substitution; use an absolute path or ~/ path"
+        )
+
+    literal_path = Path(value)
+    if literal_path.is_absolute():
+        configured = literal_path
+    elif value.startswith("~/"):
+        configured = Path(os.path.expanduser(value))
+    else:
+        raise GlobalInstructionsConfigError(
+            "global_instructions_file must be an absolute path or start with ~/; "
+            f"got {value!r}"
+        )
+    return configured
+
+
 def read_raw_config_readonly() -> Dict[str, Any]:
     """Fast-path variant of ``read_raw_config()`` for callers that ONLY READ.
 
@@ -5432,6 +5537,15 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
+    if key.strip() == "global_instructions_file" and global_instructions_uses_named_profile():
+        from hermes_constants import get_default_hermes_root
+
+        print(
+            "Cannot set 'global_instructions_file' in a named profile: it is "
+            f"host-global and may only be edited in {get_default_hermes_root() / 'config.yaml'}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the
     # source. Distinct from is_managed() above (the package-manager write-lock).
@@ -5684,7 +5798,17 @@ def set_config_value(key: str, value: str, force: bool = False):
 
 def get_config_value(key: str, *, as_json: bool = False):
     """Print a resolved configuration value."""
-    if _is_env_config_key(key):
+    if key.strip() == "global_instructions_file":
+        # This setting is the one explicit exception to profile isolation.
+        # Resolve it against the default root even when the active CLI profile
+        # is named; do not report the profile-local schema default.
+        from hermes_constants import get_hermes_home
+
+        value = resolve_global_instructions_file(
+            active_home=get_hermes_home()
+        )
+        value = str(value) if value is not None else ""
+    elif _is_env_config_key(key):
         env_value = get_env_value(key.upper())
         value = _MISSING if env_value is None else env_value
     else:

@@ -7,9 +7,11 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import json
 import time
-from unittest.mock import patch
+from pathlib import Path
 from typing import Any, Optional
+from unittest.mock import patch
 
 import pytest
 
@@ -165,14 +167,148 @@ class TestLifecycle:
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching
-        config.toml [permissions] table). Letting codex use its default
-        (read-only unless user configures otherwise) is the documented path."""
+        config.toml [permissions] table). Process-level CLI overrides own the
+        sandbox and approval boundary instead."""
         client = FakeClient()
         s = make_session(client, permission_profile="workspace-write")
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_project_config_cannot_widen_host_owned_runtime_boundaries(self):
+        client = FakeClient()
+        construction = {}
+        session = CodexAppServerSession(
+            cwd="/tmp/hostile-project",
+            permission_profile="full-access",
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=False,
+                auto_approve_apply_patch=False,
+            ),
+            client_factory=lambda **kwargs: construction.update(kwargs) or client,
+        )
+
+        session.ensure_started()
+
+        overrides = construction["extra_args"]
+        assert 'sandbox_mode="workspace-write"' in overrides
+        assert 'approval_policy="on-request"' in overrides
+        assert 'shell_environment_policy.inherit="core"' in overrides
+        assert "sandbox_workspace_write.writable_roots=[]" in overrides
+        assert "sandbox_workspace_write.network_access=false" in overrides
+        project = Path("/tmp/hostile-project").resolve()
+        project_entries = ",".join(
+            f'{json.dumps(str(candidate))}={{trust_level="untrusted"}}'
+            for candidate in (project, *project.parents)
+        )
+        assert f"projects={{{project_entries}}}" in overrides
+        assert not any(arg.startswith("projects.") for arg in overrides)
+
+    def test_explicit_approval_bypass_allows_requested_full_access(self):
+        client = FakeClient()
+        construction = {}
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            permission_profile="full-access",
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                auto_approve_apply_patch=True,
+            ),
+            client_factory=lambda **kwargs: construction.update(kwargs) or client,
+        )
+
+        session.ensure_started()
+
+        overrides = construction["extra_args"]
+        assert 'sandbox_mode="danger-full-access"' in overrides
+        assert 'approval_policy="never"' in overrides
+
+    def test_developer_instructions_are_sent_exactly_once_on_thread_start(self):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        frozen_policy = (
+            "# Trusted Host Policy\n\n"
+            'Source: "/tmp/POLICY.md"\n'
+            f"SHA-256: {'a' * 64}\n\n"
+            "Never leak secrets."
+        )
+        s = make_session(client, developer_instructions=frozen_policy)
+
+        s.run_turn("first", turn_timeout=2.0)
+
+        thread_calls = [
+            params for method, params in client.requests if method == "thread/start"
+        ]
+        turn_calls = [
+            params for method, params in client.requests if method == "turn/start"
+        ]
+        assert thread_calls == [
+            {"cwd": "/tmp", "developerInstructions": frozen_policy}
+        ]
+        assert len(turn_calls) == 1
+        assert "developerInstructions" not in turn_calls[0]
+
+    def test_project_developer_instructions_are_never_promoted(self):
+        client = FakeClient()
+
+        def configured(method, params):
+            if method == "config/read":
+                raise AssertionError("cwd-effective config must not be read")
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            return {}
+
+        client._request_handler = configured
+        s = make_session(client, developer_instructions="TRUSTED HOST POLICY")
+
+        s.ensure_started()
+
+        _method, params = next(
+            request for request in client.requests if request[0] == "thread/start"
+        )
+        assert params["developerInstructions"] == "TRUSTED HOST POLICY"
+        assert not any(method == "config/read" for method, _params in client.requests)
+
+    @pytest.mark.parametrize("developer_instructions", [None, ""])
+    def test_empty_developer_instructions_are_omitted(self, developer_instructions):
+        client = FakeClient()
+        s = make_session(client, developer_instructions=developer_instructions)
+
+        s.ensure_started()
+
+        _method, params = next(
+            request for request in client.requests if request[0] == "thread/start"
+        )
+        assert params == {"cwd": "/tmp"}
+
+    def test_thread_start_rejection_surfaces_policy_handoff_failure(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+
+        def reject_policy(method, _params):
+            if method == "thread/start":
+                raise CodexAppServerError(
+                    code=-32602,
+                    message="developerInstructions is not accepted",
+                )
+            return {}
+
+        client._request_handler = reject_policy
+        s = make_session(client, developer_instructions="trusted policy")
+
+        result = s.run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is not None
+        assert "codex app-server startup failed" in result.error
+        assert "developerInstructions is not accepted" in result.error
+        assert result.should_retire is True
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -895,4 +1031,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

@@ -263,6 +263,30 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert '$(and this is not shell)' in content
 
 
+def test_local_delivery_refuses_controller_only_profile_before_spawn(
+    tmp_path, monkeypatch
+):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("delivery-reviewer",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    profile_meta = home / "profiles" / "delivery-reviewer" / "profile.yaml"
+    profile_meta.write_text(
+        profile_meta.read_text(encoding="utf-8")
+        + "dispatch_mode: controller-only\n",
+        encoding="utf-8",
+    )
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="delivery-reviewer", message="please review", agent=agent
+        )
+    )
+
+    assert "error" in result
+    assert "controller" in result["error"]
+    assert calls == []
+
+
 def test_peer_delivery_command(tmp_path, monkeypatch):
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, peers=("spark",))

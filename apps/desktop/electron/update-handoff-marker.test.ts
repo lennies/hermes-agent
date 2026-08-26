@@ -75,7 +75,6 @@ function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => R
   assert.equal(markerStartedAt(preserved.home), acquiredAt, 'the script must preserve the Desktop acquisition time')
 
   const refreshed = sandbox('refreshed')
-  fs.writeFileSync(path.join(refreshed.home, '.hermes-update-in-progress'), '999999\n1\n')
   const before = Math.floor(Date.now() / 1000)
   const refreshedResult = run(refreshed.installRoot, 'malformed')
   const after = Math.floor(Date.now() / 1000)
@@ -84,6 +83,17 @@ function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => R
   assert.ok(
     markerStartedAt(refreshed.home) >= before && markerStartedAt(refreshed.home) <= after,
     'an invalid hand-off timestamp must start a fresh claim'
+  )
+
+  const contended = sandbox('contended')
+  const existing = `${process.pid}\n${Math.floor(Date.now() / 1000)}\nexisting-token\n`
+  fs.writeFileSync(path.join(contended.home, '.hermes-update-in-progress'), existing)
+  const contendedResult = run(contended.installRoot)
+  assert.equal(contendedResult.status, 2)
+  assert.equal(
+    fs.readFileSync(path.join(contended.home, '.hermes-update-in-progress'), 'utf8'),
+    existing,
+    'a losing script must not overwrite the live owner'
   )
 
   const oversized = sandbox('oversized')
@@ -98,10 +108,18 @@ function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => R
   )
 }
 
-test.skipIf(process.platform === 'win32')('POSIX hand-off preserves the Desktop marker acquisition time', () => {
-  assertScriptHandoff(runPosix)
-})
+test.skipIf(process.platform === 'win32')(
+  'POSIX hand-off preserves the Desktop marker acquisition time',
+  () => {
+    assertScriptHandoff(runPosix)
+  },
+  30_000
+)
 
-test.skipIf(process.platform !== 'win32')('PowerShell hand-off preserves the Desktop marker acquisition time', () => {
-  assertScriptHandoff(runWindows)
-})
+test.skipIf(process.platform !== 'win32')(
+  'PowerShell hand-off preserves the Desktop marker acquisition time',
+  () => {
+    assertScriptHandoff(runWindows)
+  },
+  30_000
+)

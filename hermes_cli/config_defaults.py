@@ -6,6 +6,10 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 
 DEFAULT_CONFIG = {
     "model": "",
+    # Optional host-wide instructions loaded into every agent prompt. This is
+    # resolved only from the default Hermes root; named profiles may not
+    # override it. Empty disables the feature.
+    "global_instructions_file": "",
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},

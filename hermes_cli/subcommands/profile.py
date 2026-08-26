@@ -106,6 +106,18 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     profile_show = profile_subparsers.add_parser("show", help="Show profile details")
     profile_show.add_argument("profile_name", help="Profile to show")
 
+    profile_dispatch_mode = profile_subparsers.add_parser(
+        "dispatch-mode",
+        help="Read or set automated Kanban dispatch policy",
+    )
+    profile_dispatch_mode.add_argument("profile_name", help="Profile to inspect")
+    profile_dispatch_mode.add_argument(
+        "mode",
+        nargs="?",
+        choices=("generic", "controller-only", "disabled"),
+        help="New mode (omit to read the current mode)",
+    )
+
     profile_alias = profile_subparsers.add_parser(
         "alias", help="Manage wrapper scripts"
     )

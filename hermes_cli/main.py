@@ -3124,6 +3124,16 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    from hermes_cli.profiles import (
+        get_active_profile_name,
+        require_unclaimed_profile_turn,
+    )
+
+    # A full chat turn is an unclaimed execution surface. Controller-only
+    # profiles are admitted exclusively by dispatch_controller_task's exact
+    # claim + confined spawn path, never by CLI, cron, Bot Mode, or relay.
+    require_unclaimed_profile_turn(get_active_profile_name() or "default")
+
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -11301,13 +11311,15 @@ def cmd_profile(args):
         skills = _count_skills(profile_dir)
         dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
         alias_name = find_alias_for_profile(name)
-        display = read_profile_meta(profile_dir).get("display_name", "")
+        profile_meta = read_profile_meta(profile_dir)
+        display = profile_meta.get("display_name", "")
 
         print(f"\nProfile: {format_profile_label(name, display)}")
         print(f"Path:    {profile_dir}")
         if model:
             print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
         print(f"Gateway: {'running' if gw else 'stopped'}")
+        print(f"Dispatch: {profile_meta.get('dispatch_mode', 'disabled')}")
         print(f"Skills:  {skills}")
         print(
             f".env:    {'exists' if (profile_dir / '.env').exists() else 'not configured'}"
@@ -11325,6 +11337,30 @@ def cmd_profile(args):
             wrapper = _get_wrapper_dir() / (f"{alias_name}.bat" if is_windows else alias_name)
             print(f"Alias:   {alias_name} → hermes -p {name}  ({wrapper})")
         print()
+
+    elif action == "dispatch-mode":
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            profile_exists,
+            read_profile_meta,
+            set_profile_dispatch_mode,
+        )
+
+        name = args.profile_name
+        if not profile_exists(name):
+            print(f"Error: Profile '{name}' does not exist.")
+            sys.exit(1)
+        mode = getattr(args, "mode", None)
+        try:
+            if mode is not None:
+                current = set_profile_dispatch_mode(name, mode)
+                print(f"Dispatch mode updated for '{name}': {current}")
+            else:
+                current = read_profile_meta(get_profile_dir(name))["dispatch_mode"]
+                print(current)
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
 
     elif action == "alias":
         name = args.profile_name
@@ -12485,6 +12521,17 @@ def _prepare_agent_startup(args) -> None:
         or (_sub_attr and getattr(args, _sub_attr, None) in _sub_set)
     ):
         return
+
+    from hermes_cli.profiles import (
+        get_active_profile_name,
+        require_unclaimed_profile_turn,
+    )
+
+    # All entrypoints reaching this function can execute a full agent turn
+    # (chat, ACP, gateway, cron run/tick, and related lanes). Refuse governed
+    # profiles before plugin/MCP/tool discovery; exact controller dispatch
+    # uses its own non-CLI confined spawn callback and never needs this path.
+    require_unclaimed_profile_turn(get_active_profile_name() or "default")
 
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
     if not _is_tui_chat_launch(args):

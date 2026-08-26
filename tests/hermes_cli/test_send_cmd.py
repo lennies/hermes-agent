@@ -64,6 +64,86 @@ def fake_tool(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_find_marker_calls_actor_bound_read_without_consuming_stdin(
+    fake_tool, capsys, monkeypatch
+):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    args = _parse([
+        "--to",
+        "slack:C12345678:1710000000.123456",
+        "--find-marker",
+        "elfos-repository-delivery:" + "a" * 64,
+        "--workspace-id",
+        "T12345678",
+        "--actor-id",
+        "U12345678",
+        "--json",
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "find",
+        "target": "slack:C12345678:1710000000.123456",
+        "marker": "elfos-repository-delivery:" + "a" * 64,
+        "workspace_id": "T12345678",
+        "actor_id": "U12345678",
+    }]
+    assert json.loads(capsys.readouterr().out)["success"] is True
+
+
+def test_ensure_marker_passes_exact_message_and_identity(fake_tool, monkeypatch):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    marker = "elfos-repository-delivery:" + "b" * 64
+    message = marker + "\nProduction verified."
+    args = _parse([
+        "--to",
+        "slack:C12345678:1710000000.123456",
+        "--ensure-marker",
+        marker,
+        "--workspace-id",
+        "T12345678",
+        "--actor-id",
+        "U12345678",
+        message,
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "ensure",
+        "target": "slack:C12345678:1710000000.123456",
+        "message": message,
+        "marker": marker,
+        "workspace_id": "T12345678",
+        "actor_id": "U12345678",
+    }]
+
+
+def test_marker_operation_requires_closed_identity_binding(
+    fake_tool, capsys, monkeypatch
+):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    args = _parse([
+        "--to",
+        "slack:C12345678:1710000000.123456",
+        "--find-marker",
+        "elfos-repository-delivery:" + "a" * 64,
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert "--workspace-id and --actor-id" in capsys.readouterr().err
+    assert fake_tool.calls == []
+
+
 
 
 

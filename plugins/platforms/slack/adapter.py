@@ -9012,6 +9012,285 @@ def _trim_slack_dm_cache() -> None:
         _slack_dm_cache.pop(next(iter(_slack_dm_cache)))
 
 
+def _standalone_tokens(pconfig) -> List[str]:
+    """Return configured Slack bot tokens without exposing them to callers."""
+    raw_token = getattr(pconfig, "token", None) or get_secret("SLACK_BOT_TOKEN", "")
+    tokens = [token.strip() for token in str(raw_token or "").split(",") if token.strip()]
+    try:
+        from hermes_constants import get_hermes_home
+
+        tokens_file = get_hermes_home() / "slack_tokens.json"
+        if tokens_file.exists():
+            saved = json.loads(tokens_file.read_text(encoding="utf-8"))
+            for entry in saved.values():
+                token = entry.get("token", "") if isinstance(entry, dict) else ""
+                if token and token not in tokens:
+                    tokens.append(token)
+    except Exception:
+        pass
+    return tokens
+
+
+async def find_standalone_thread_marker(
+    pconfig,
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    workspace_id: str,
+    actor_id: str,
+) -> Dict[str, Any]:
+    """Find one unique bot-authored marker in a Slack thread.
+
+    The complete paginated thread is read with each workspace token until one
+    token proves channel access. A requester-authored collision fails closed;
+    callers never accept text ownership from marker content alone.
+    """
+    if not re.fullmatch(r"elfos-repository-delivery:[0-9a-f]{64}", marker or ""):
+        return {"error": "Slack marker is invalid"}
+    if not re.fullmatch(r"[CGD][A-Z0-9]{8,}", str(chat_id or "")):
+        return {"error": "Slack conversation is invalid"}
+    if not re.fullmatch(r"\d{10,}(?:\.\d+)?", str(thread_id or "")):
+        return {"error": "Slack thread is invalid"}
+    if not re.fullmatch(r"T[A-Z0-9]{8,}", str(workspace_id or "")):
+        return {"error": "Slack workspace is invalid"}
+    if not re.fullmatch(r"[UW][A-Z0-9]{8,}", str(actor_id or "")):
+        return {"error": "Slack actor is invalid"}
+    tokens = _standalone_tokens(pconfig)
+    if not tokens:
+        return {"error": "Slack marker read failed: SLACK_BOT_TOKEN not configured"}
+    try:
+        from gateway.platforms.base import proxy_kwargs_for_aiohttp
+
+        proxy = resolve_proxy_url()
+        session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(proxy)
+        retryable = {
+            "invalid_auth",
+            "not_authed",
+            "token_revoked",
+            "account_inactive",
+            "not_in_channel",
+            "channel_not_found",
+        }
+        last_error = "no matching configured workspace actor"
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30), **session_kwargs
+        ) as session:
+            for token in tokens:
+                headers = {"Authorization": f"Bearer {token}"}
+                async with session.post(
+                    "https://slack.com/api/auth.test",
+                    headers=headers,
+                    **request_kwargs,
+                ) as response:
+                    identity = await response.json()
+                if not identity.get("ok"):
+                    last_error = identity.get("error", "unknown")
+                    if last_error in retryable:
+                        continue
+                    return {"error": f"Slack marker identity failed: {last_error}"}
+                authenticated_workspace_id = str(identity.get("team_id") or "")
+                authenticated_actor_id = str(identity.get("user_id") or "")
+                if not re.fullmatch(
+                    r"T[A-Z0-9]{8,}", authenticated_workspace_id
+                ) or not re.fullmatch(r"[UW][A-Z0-9]{8,}", authenticated_actor_id):
+                    return {"error": "Slack marker identity is incomplete"}
+                if (
+                    authenticated_workspace_id != workspace_id
+                    or authenticated_actor_id != actor_id
+                ):
+                    continue
+                messages = []
+                cursor = ""
+                for _page in range(20):
+                    params = {
+                        "channel": chat_id,
+                        "ts": thread_id,
+                        "limit": 200,
+                        "inclusive": "true",
+                    }
+                    if cursor:
+                        params["cursor"] = cursor
+                    async with session.get(
+                        "https://slack.com/api/conversations.replies",
+                        headers=headers,
+                        params=params,
+                        **request_kwargs,
+                    ) as response:
+                        page = await response.json()
+                    if not page.get("ok"):
+                        last_error = page.get("error", "unknown")
+                        if last_error in retryable:
+                            break
+                        return {"error": f"Slack marker read failed: {last_error}"}
+                    rows = page.get("messages")
+                    if not isinstance(rows, list):
+                        return {"error": "Slack marker thread is incomplete"}
+                    messages.extend(rows)
+                    cursor = str(
+                        ((page.get("response_metadata") or {}).get("next_cursor") or "")
+                    )
+                    if not cursor:
+                        collisions = []
+                        for row in messages:
+                            if not isinstance(row, dict):
+                                continue
+                            text = str(row.get("text") or "")
+                            if text != marker and not text.startswith(marker + "\n"):
+                                continue
+                            row_ts = str(row.get("ts") or "")
+                            row_thread = str(row.get("thread_ts") or "")
+                            if row_ts == thread_id or row_thread == thread_id:
+                                collisions.append(row)
+                        if any(
+                            str(row.get("user") or "") != actor_id
+                            for row in collisions
+                        ):
+                            return {"error": "Slack marker is owned by another actor"}
+                        owned = [
+                            row for row in collisions
+                            if str(row.get("user") or "") == actor_id
+                        ]
+                        if len(owned) > 1:
+                            return {"error": "Slack marker is not unique"}
+                        if not owned:
+                            return {
+                                "success": True,
+                                "found": False,
+                                "platform": "slack",
+                                "workspace_id": workspace_id,
+                                "chat_id": chat_id,
+                                "thread_id": thread_id,
+                                "actor_id": actor_id,
+                            }
+                        message_id = str(owned[0].get("ts") or "")
+                        if not message_id:
+                            return {"error": "Slack marker message is incomplete"}
+                        return {
+                            "success": True,
+                            "found": True,
+                            "platform": "slack",
+                            "workspace_id": workspace_id,
+                            "chat_id": chat_id,
+                            "thread_id": thread_id,
+                            "message_id": message_id,
+                            "actor_id": actor_id,
+                            "text": str(owned[0].get("text") or ""),
+                        }
+                else:
+                    return {"error": "Slack marker thread exceeds its page bound"}
+                if last_error in retryable:
+                    continue
+        return {"error": f"Slack marker read failed: {last_error}"}
+    except Exception as error:
+        return {"error": f"Slack marker read failed: {error}"}
+
+
+async def ensure_standalone_thread_marker(
+    pconfig,
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    message: str,
+    workspace_id: str,
+    actor_id: str,
+) -> Dict[str, Any]:
+    """Idempotently create one exact marker with actor-bound readback.
+
+    Selection of the write token is constrained by ``auth.test`` before the
+    mutation. A post-send read always runs, including after an ambiguous HTTP
+    failure, so response loss cannot trigger an unverified retry.
+    """
+    if type(message) is not str or (
+        message != marker and not message.startswith(marker + "\n")
+    ):
+        return {"error": "Slack marker message is invalid"}
+
+    before = await find_standalone_thread_marker(
+        pconfig,
+        chat_id,
+        thread_id,
+        marker,
+        workspace_id,
+        actor_id,
+    )
+    if before.get("error") or before.get("found"):
+        if before.get("found") and before.get("text") != message:
+            return {"error": "Slack marker exists with different message text"}
+        return before
+
+    tokens = _standalone_tokens(pconfig)
+    try:
+        from gateway.platforms.base import proxy_kwargs_for_aiohttp
+
+        proxy = resolve_proxy_url()
+        session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(proxy)
+        selected_token = None
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30), **session_kwargs
+        ) as session:
+            for token in tokens:
+                headers = {"Authorization": f"Bearer {token}"}
+                async with session.post(
+                    "https://slack.com/api/auth.test",
+                    headers=headers,
+                    **request_kwargs,
+                ) as response:
+                    identity = await response.json()
+                if (
+                    identity.get("ok")
+                    and identity.get("team_id") == workspace_id
+                    and identity.get("user_id") == actor_id
+                ):
+                    selected_token = token
+                    break
+            if selected_token is None:
+                return {"error": "Slack marker write identity is unavailable"}
+
+            send_error = None
+            try:
+                headers = {
+                    "Authorization": f"Bearer {selected_token}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "channel": chat_id,
+                    "thread_ts": thread_id,
+                    "text": message,
+                    "mrkdwn": True,
+                }
+                async with session.post(
+                    "https://slack.com/api/chat.postMessage",
+                    headers=headers,
+                    json=payload,
+                    **request_kwargs,
+                ) as response:
+                    sent = await response.json()
+                if not sent.get("ok"):
+                    send_error = str(sent.get("error") or "unknown")
+            except Exception as error:
+                send_error = str(error)
+
+        after = await find_standalone_thread_marker(
+            pconfig,
+            chat_id,
+            thread_id,
+            marker,
+            workspace_id,
+            actor_id,
+        )
+        if after.get("found"):
+            if after.get("text") != message:
+                return {"error": "Slack marker readback differs from requested message"}
+            return {**after, "created": True}
+        if after.get("error"):
+            return after
+        if send_error:
+            return {"error": f"Slack marker send failed: {send_error}"}
+        return {"error": "Slack marker send was not visible on exact readback"}
+    except Exception as error:
+        return {"error": f"Slack marker send failed: {error}"}
+
+
 async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
     """Resolve a Slack user ID (U.../W...) to a DM conversation ID (D...).
 
@@ -9133,26 +9412,9 @@ async def _standalone_send(
     # Profile-scoped read: under multiplex os.environ may hold ANOTHER
     # profile's bot token (first-writer-wins env bridges), so honor the
     # secret scope's verdict instead of reading the process env directly.
-    raw_token = getattr(pconfig, "token", None) or get_secret("SLACK_BOT_TOKEN", "")
-
     # ``SLACK_BOT_TOKEN`` can be a comma-separated list in multi-workspace
-    # gateways, and OAuth installs persist per-workspace tokens in
-    # slack_tokens.json. The standalone path has no team→client map, so try
-    # each token individually instead of sending the literal comma-joined
-    # string, which Slack rejects as ``invalid_auth`` (#47547).
-    tokens = [t.strip() for t in str(raw_token or "").split(",") if t.strip()]
-    try:
-        from hermes_constants import get_hermes_home
-
-        _tokens_file = get_hermes_home() / "slack_tokens.json"
-        if _tokens_file.exists():
-            _saved = json.loads(_tokens_file.read_text(encoding="utf-8"))
-            for _entry in _saved.values():
-                _tok = _entry.get("token", "") if isinstance(_entry, dict) else ""
-                if _tok and _tok not in tokens:
-                    tokens.append(_tok)
-    except Exception:
-        pass
+    # gateways; the helper also includes persisted OAuth-install tokens.
+    tokens = _standalone_tokens(pconfig)
     if not tokens:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
     token = tokens[0]

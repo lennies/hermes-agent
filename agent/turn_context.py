@@ -772,6 +772,17 @@ def build_turn_context(
 
     active_system_prompt = agent._cached_system_prompt
 
+    # Auxiliary model calls made during this turn inherit the main session's
+    # integrity-verified trusted-host-policy snapshot. Bind only after restore
+    # or fresh construction has selected the authoritative cached prompt.
+    from agent.auxiliary_client import bind_runtime_trusted_policy_from_prompt
+    from agent.system_prompt import _agent_home
+
+    bind_runtime_trusted_policy_from_prompt(
+        active_system_prompt or "",
+        active_home=_agent_home(agent),
+    )
+
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat"
     # session on Bot-Mode-managed installs (same gate as the protocol
     # section above). The gate is stable for a session's lifetime, so the

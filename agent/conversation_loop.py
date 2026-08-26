@@ -911,6 +911,34 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
+    if stored_prompt:
+        from agent.prompt_builder import (
+            TrustedPolicySnapshotKind,
+            inspect_trusted_policy_snapshot,
+            load_global_instructions_file,
+            render_trusted_policy_snapshot_block,
+        )
+        from agent.system_prompt import _agent_home
+
+        _stored_policy = inspect_trusted_policy_snapshot(stored_prompt)
+        if _stored_policy.kind is TrustedPolicySnapshotKind.INVALID:
+            if _stored_policy.frame_present:
+                # A claimed frame that does not verify is trusted-state
+                # corruption. Never silently rebuild or downgrade it.
+                render_trusted_policy_snapshot_block(_stored_policy)
+            elif load_global_instructions_file(active_home=_agent_home(agent)) is not None:
+                # One-time upgrade for sessions persisted before the host
+                # policy envelope existed. Their unframed prompt cannot prove
+                # policy presence or absence, so rebuild under current host
+                # policy and persist the framed result below.
+                logger.info(
+                    "Stored system prompt for session %s predates trusted host "
+                    "policy snapshots; rebuilding once.",
+                    agent.session_id,
+                )
+                stored_prompt = None
+                stored_state = "legacy_unframed"
+
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Bot Chat capability epoch: an eternal bot session must adopt
         # user-initiated capability changes (skills/toolsets/MCP/SOUL/roster)
@@ -1817,6 +1845,37 @@ def _notify_context_engine_turn_complete(
             getattr(agent, "session_id", None) or "-",
             exc_info=True,
         )
+
+
+def _trusted_policy_ascii_protected_prefixes(
+    system_prompt: Optional[str],
+) -> tuple[str, ...]:
+    """Return an ASCII-safe verified prefix that recovery must not rewrite."""
+    if not isinstance(system_prompt, str):
+        return ()
+    from agent.prompt_builder import (
+        GlobalInstructionsError,
+        TrustedPolicySnapshotKind,
+        inspect_trusted_policy_snapshot,
+        render_trusted_policy_snapshot_block,
+    )
+
+    snapshot = inspect_trusted_policy_snapshot(system_prompt)
+    if (
+        snapshot.kind is TrustedPolicySnapshotKind.CONFIGURED
+        and snapshot.configured is not None
+    ):
+        trusted_prefix = snapshot.configured.trusted_prefix
+        try:
+            trusted_prefix.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise GlobalInstructionsError(
+                "Trusted host policy snapshot cannot be sent through an ASCII-only transport"
+            ) from exc
+        return (trusted_prefix,)
+    if snapshot.frame_present and snapshot.kind is TrustedPolicySnapshotKind.INVALID:
+        render_trusted_policy_snapshot_block(snapshot)
+    return ()
 
 
 def run_conversation(
@@ -2978,7 +3037,14 @@ def run_conversation(
                 # the string. Fast no-op when the payload is clean.
                 _sanitize_structure_surrogates(api_kwargs)
                 if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
+                    _sanitize_structure_non_ascii(
+                        api_kwargs,
+                        protected_prefixes=(
+                            _trusted_policy_ascii_protected_prefixes(
+                                active_system_prompt
+                            )
+                        ),
+                    )
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(
                         api_kwargs,
@@ -4522,13 +4588,27 @@ def run_conversation(
                         # reasoning_content that are not in `messages`).
                         _messages_sanitized = _sanitize_messages_non_ascii(messages)
                         if isinstance(api_messages, list):
-                            _sanitize_messages_non_ascii(api_messages)
+                            _sanitize_messages_non_ascii(
+                                api_messages,
+                                protected_prefixes=(
+                                    _trusted_policy_ascii_protected_prefixes(
+                                        active_system_prompt
+                                    )
+                                ),
+                            )
                         # Also sanitize the last api_kwargs if already built,
                         # so a leftover non-ASCII value in a transformed field
                         # (e.g. extra_body, reasoning_content) doesn't survive
                         # into the next attempt via _build_api_kwargs cache paths.
                         if isinstance(api_kwargs, dict):
-                            _sanitize_structure_non_ascii(api_kwargs)
+                            _sanitize_structure_non_ascii(
+                                api_kwargs,
+                                protected_prefixes=(
+                                    _trusted_policy_ascii_protected_prefixes(
+                                        active_system_prompt
+                                    )
+                                ),
+                            )
                         _prefill_sanitized = False
                         if isinstance(getattr(agent, "prefill_messages", None), list):
                             _prefill_sanitized = _sanitize_messages_non_ascii(agent.prefill_messages)
@@ -4537,13 +4617,13 @@ def run_conversation(
                         if isinstance(getattr(agent, "tools", None), list):
                             _tools_sanitized = _sanitize_tools_non_ascii(agent.tools)
 
+                        # The cached system prompt may begin with a signed
+                        # trusted-policy frame. Mutating it would invalidate
+                        # the recorded byte offsets/digest and silently weaken
+                        # the policy on retry. Preserve it exactly; header,
+                        # credential, tool, and lower-trust payload recovery
+                        # remains bounded below.
                         _system_sanitized = False
-                        if isinstance(active_system_prompt, str):
-                            _sanitized_system = _strip_non_ascii(active_system_prompt)
-                            if _sanitized_system != active_system_prompt:
-                                active_system_prompt = _sanitized_system
-                                agent._cached_system_prompt = _sanitized_system
-                                _system_sanitized = True
                         if isinstance(getattr(agent, "ephemeral_system_prompt", None), str):
                             _sanitized_ephemeral = _strip_non_ascii(agent.ephemeral_system_prompt)
                             if _sanitized_ephemeral != agent.ephemeral_system_prompt:

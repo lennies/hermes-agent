@@ -1,5 +1,6 @@
 """Phase 4: lifecycle guard + per-profile observability."""
 import pytest
+from unittest.mock import patch
 
 from gateway.config import GatewayConfig
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
@@ -19,6 +20,20 @@ class TestServedProfilesStatus:
             assert rec.get("served_profiles") == ["default", "coder"]
         finally:
             importlib.reload(status)
+
+    @pytest.mark.asyncio
+    async def test_single_profile_startup_stamps_explicit_served_set(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch("gateway.status.write_runtime_status") as write_status:
+            connected = await runner._start_secondary_profile_adapters()
+
+        assert connected == 0
+        write_status.assert_called_once_with(served_profiles=["default"])
 
 
 def test_cron_profile_homes_follow_allowlist(tmp_path, monkeypatch):
@@ -121,5 +136,4 @@ class TestNamedProfileMultiplexerGuard:
         from hermes_cli import gateway as gw
 
         gw._guard_named_profile_under_multiplexer(force=False)
-
 

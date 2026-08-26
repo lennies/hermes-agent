@@ -44,6 +44,9 @@ from hermes_cli.profiles import (
     NO_BUNDLED_SKILLS_MARKER,
     backfill_profile_envs,
     profiles_to_serve,
+    profile_dispatch_allowed,
+    require_unclaimed_profile_turn,
+    set_profile_dispatch_mode,
 )
 from hermes_cli.config import DEFAULT_CONFIG
 
@@ -107,6 +110,105 @@ class TestGetProfileDir:
         assert result == tmp_path / ".hermes"
 
 
+class TestProfileDispatchMode:
+    def test_missing_metadata_defaults_to_generic_dispatch(self, profile_env):
+        create_profile("worker", no_alias=True)
+        assert profile_dispatch_allowed("worker") is True
+
+    def test_controller_only_requires_explicit_controller_authority(self, profile_env):
+        create_profile("worker", no_alias=True)
+        assert set_profile_dispatch_mode("worker", "controller-only") == "controller-only"
+        assert profile_dispatch_allowed("worker") is False
+        assert profile_dispatch_allowed("worker", authority="controller") is True
+
+    def test_disabled_and_malformed_metadata_fail_closed(self, profile_env):
+        profile_dir = create_profile("worker", no_alias=True)
+        set_profile_dispatch_mode("worker", "disabled")
+        assert profile_dispatch_allowed("worker") is False
+        (profile_dir / "profile.yaml").write_text(
+            "dispatch_mode: future-mode\n", encoding="utf-8"
+        )
+        assert profile_dispatch_allowed("worker") is False
+        assert profile_dispatch_allowed("worker", authority="controller") is False
+
+    def test_invalid_dispatch_mode_is_rejected(self, profile_env):
+        create_profile("worker", no_alias=True)
+        with pytest.raises(ValueError, match="dispatch mode"):
+            set_profile_dispatch_mode("worker", "open")
+
+    def test_controller_only_refuses_unclaimed_full_turn(self, profile_env):
+        create_profile("worker", no_alias=True)
+        set_profile_dispatch_mode("worker", "controller-only")
+        with pytest.raises(PermissionError, match="authenticated controller"):
+            require_unclaimed_profile_turn("worker")
+
+    def test_generic_accepts_unclaimed_full_turn(self, profile_env):
+        create_profile("worker", no_alias=True)
+        assert require_unclaimed_profile_turn("worker") == "worker"
+
+    def test_explicit_root_uses_same_dispatch_policy_matrix(
+        self, profile_env
+    ):
+        root = profile_env / ".hermes"
+        create_profile("generic", no_alias=True)
+        create_profile("governed", no_alias=True)
+        create_profile("disabled", no_alias=True)
+        set_profile_dispatch_mode("governed", "controller-only")
+        set_profile_dispatch_mode("disabled", "disabled")
+        (get_profile_dir("disabled") / "profile.yaml").write_text(
+            "dispatch_mode: [broken\n", encoding="utf-8"
+        )
+
+        assert require_unclaimed_profile_turn("default", root=root) == "default"
+        assert require_unclaimed_profile_turn("generic", root=root) == "generic"
+        for name in ("governed", "disabled", "missing"):
+            with pytest.raises(PermissionError):
+                require_unclaimed_profile_turn(name, root=root)
+
+    def test_chat_cli_refuses_controller_only_profile_before_startup(
+        self, profile_env
+    ):
+        from hermes_cli.main import cmd_chat
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="worker"
+        ), patch(
+            "hermes_cli.profiles.profile_dispatch_allowed", return_value=False
+        ), pytest.raises(PermissionError, match="controller"):
+            cmd_chat(types.SimpleNamespace(cli=True, tui=False))
+
+    def test_raw_cli_refuses_controller_only_profile_before_agent_startup(
+        self, profile_env, monkeypatch
+    ):
+        import cli as raw_cli
+
+        create_profile("worker", no_alias=True)
+        set_profile_dispatch_mode("worker", "controller-only")
+        monkeypatch.setenv("HERMES_PROFILE", "worker")
+
+        with pytest.raises(PermissionError, match="authenticated controller"):
+            raw_cli.main(query="must not start", quiet=True)
+
+    def test_agent_startup_refuses_controller_only_before_discovery(
+        self, profile_env
+    ):
+        from hermes_cli.main import _prepare_agent_startup
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="worker"
+        ), patch(
+            "hermes_cli.profiles.profile_dispatch_allowed", return_value=False
+        ), patch(
+            "hermes_cli.plugins.start_background_plugin_discovery"
+        ) as discover, pytest.raises(PermissionError, match="controller"):
+            _prepare_agent_startup(
+                types.SimpleNamespace(
+                    command="chat", yolo=False, safe_mode=False, tui=False
+                )
+            )
+        discover.assert_not_called()
+
+
 # ===================================================================
 # TestCreateProfile
 # ===================================================================
@@ -150,6 +252,29 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+
+    def test_clone_does_not_copy_host_global_instruction_setting(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model: test\nglobal_instructions_file: /host/policy.md\n",
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        cloned = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert "global_instructions_file" not in cloned
+
+    def test_clone_all_does_not_copy_host_global_instruction_setting(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "global_instructions_file: /host/policy.md\n", encoding="utf-8"
+        )
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        cloned = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert "global_instructions_file" not in cloned
 
 
 
@@ -759,6 +884,39 @@ class TestExportImport:
         assert "default/SOUL.md" in names
         assert "default/memories/MEMORY.md" in names
 
+    def test_export_strips_host_global_instruction_setting(self, profile_env, tmp_path):
+        default_dir = get_profile_dir("default")
+        (default_dir / "config.yaml").write_text(
+            "model: test\nglobal_instructions_file: /host/policy.md\n",
+            encoding="utf-8",
+        )
+        output = tmp_path / "default.tar.gz"
+
+        export_profile("default", str(output))
+
+        with tarfile.open(output, "r:gz") as tf:
+            exported = yaml.safe_load(
+                tf.extractfile("default/config.yaml").read().decode("utf-8")
+            )
+        assert "global_instructions_file" not in exported
+
+    def test_import_strips_host_global_instruction_setting(self, profile_env, tmp_path):
+        staged = tmp_path / "staged"
+        source = staged / "shared"
+        source.mkdir(parents=True)
+        (source / "config.yaml").write_text(
+            "model: test\nglobal_instructions_file: /host/policy.md\n",
+            encoding="utf-8",
+        )
+        archive = tmp_path / "shared.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(source, arcname="shared")
+
+        imported_dir = import_profile(str(archive), name="imported")
+
+        imported = yaml.safe_load((imported_dir / "config.yaml").read_text())
+        assert "global_instructions_file" not in imported
+
 
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
         """Broken symlinks inside allowed artifacts are preserved, not crashed (#58394).
@@ -1065,6 +1223,21 @@ class TestProfilesToServe:
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
 
+    def test_on_omits_controller_only_and_disabled_named_profiles(self, profile_env):
+        create_profile("generic", no_alias=True)
+        create_profile("governed", no_alias=True)
+        create_profile("disabled", no_alias=True)
+        set_profile_dispatch_mode("governed", "controller-only")
+        set_profile_dispatch_mode("disabled", "disabled")
+
+        complete = dict(profiles_to_serve(multiplex=True))
+        serve = dict(
+            profiles_to_serve(multiplex=True, generic_dispatch_only=True)
+        )
+
+        assert set(complete) == {"default", "generic", "governed", "disabled"}
+        assert set(serve) == {"default", "generic"}
+
     def test_empty_allowlist_serves_only_default(self, profile_env):
         create_profile("worker", no_alias=True)
 
@@ -1135,5 +1308,3 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
-

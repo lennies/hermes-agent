@@ -335,6 +335,9 @@ def cmd_send(args: argparse.Namespace) -> None:
 
     # --list short-circuits everything else.
     if getattr(args, "list_targets", False):
+        if getattr(args, "find_marker", None) or getattr(args, "ensure_marker", None):
+            print("hermes send: --list cannot be combined with marker operations", file=sys.stderr)
+            sys.exit(_USAGE_EXIT)
         # When `--list telegram` is used, argparse stores "telegram" in the
         # `message` positional (since list_targets takes no argument).
         platform_filter = getattr(args, "message", None)
@@ -353,17 +356,62 @@ def cmd_send(args: argparse.Namespace) -> None:
         )
         sys.exit(_USAGE_EXIT)
 
-    message = _read_message_body(
-        getattr(args, "message", None),
-        getattr(args, "file", None),
-    )
-    if message is None or not message.strip():
-        print(
-            "hermes send: no message provided. Pass text as a positional "
-            "argument, use --file PATH, or pipe data via stdin.",
-            file=sys.stderr,
+    find_marker = getattr(args, "find_marker", None)
+    ensure_marker = getattr(args, "ensure_marker", None)
+    marker = find_marker or ensure_marker
+    marker_action = "find" if find_marker else "ensure" if ensure_marker else None
+    workspace_id = getattr(args, "workspace_id", None)
+    actor_id = getattr(args, "actor_id", None)
+    if marker_action:
+        if not workspace_id or not actor_id:
+            print(
+                "hermes send: marker operations require --workspace-id and --actor-id",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        if getattr(args, "subject", None):
+            print(
+                "hermes send: --subject cannot be combined with marker operations",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        if marker_action == "find":
+            if getattr(args, "message", None) or getattr(args, "file", None):
+                print(
+                    "hermes send: --find-marker does not accept a message",
+                    file=sys.stderr,
+                )
+                sys.exit(_USAGE_EXIT)
+            message = None
+        else:
+            message = _read_message_body(
+                getattr(args, "message", None),
+                getattr(args, "file", None),
+            )
+            if message is None or not message.strip():
+                print(
+                    "hermes send: --ensure-marker requires a message",
+                    file=sys.stderr,
+                )
+                sys.exit(_USAGE_EXIT)
+    else:
+        if workspace_id or actor_id:
+            print(
+                "hermes send: --workspace-id and --actor-id require a marker operation",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        message = _read_message_body(
+            getattr(args, "message", None),
+            getattr(args, "file", None),
         )
-        sys.exit(_USAGE_EXIT)
+        if message is None or not message.strip():
+            print(
+                "hermes send: no message provided. Pass text as a positional "
+                "argument, use --file PATH, or pipe data via stdin.",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
 
     # Optional: prepend a subject line. Useful for alerting scripts that
     # want a consistent header without inlining it into every call.
@@ -380,11 +428,15 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
     #
     # It expects the standard tool-call dict and returns a JSON string.
-    tool_args = {
-        "action": "send",
-        "target": target,
-        "message": message,
-    }
+    tool_args = {"action": marker_action or "send", "target": target}
+    if message is not None:
+        tool_args["message"] = message
+    if marker_action:
+        tool_args.update({
+            "marker": marker,
+            "workspace_id": workspace_id,
+            "actor_id": actor_id,
+        })
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(
@@ -468,6 +520,41 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         metavar="LINE",
         default=None,
         help="Prepend a subject/header line before the message body.",
+    )
+
+    marker_group = parser.add_mutually_exclusive_group()
+    marker_group.add_argument(
+        "--find-marker",
+        metavar="MARKER",
+        default=None,
+        help=(
+            "Read one exact repository-delivery marker from an explicit Slack "
+            "thread without sending. Requires --workspace-id and --actor-id."
+        ),
+    )
+    marker_group.add_argument(
+        "--ensure-marker",
+        metavar="MARKER",
+        default=None,
+        help=(
+            "Idempotently create or find one exact repository-delivery marker "
+            "in an explicit Slack thread. Requires a message, --workspace-id, "
+            "and --actor-id."
+        ),
+    )
+
+    parser.add_argument(
+        "--workspace-id",
+        metavar="TEAM_ID",
+        default=None,
+        help="Expected authenticated Slack workspace ID for a marker operation.",
+    )
+
+    parser.add_argument(
+        "--actor-id",
+        metavar="USER_ID",
+        default=None,
+        help="Expected authenticated Slack bot user ID for a marker operation.",
     )
 
     parser.add_argument(

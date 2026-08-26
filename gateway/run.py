@@ -2205,6 +2205,7 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
         profiles_to_serve(
             multiplex=True,
             profile_allowlist=getattr(config, "multiplex_profile_allowlist", None),
+            generic_dispatch_only=True,
         )
     )
 
@@ -15387,15 +15388,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles polling the same bot token) are detected and refused here, the
         only point that sees every profile's resolved credentials together.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
-            return 0
-
         try:
             from hermes_cli.profiles import get_active_profile_name
         except Exception:
             return 0
 
         active = get_active_profile_name() or "default"
+        if not getattr(self.config, "multiplex_profiles", False):
+            # Always replace any stale multiplex inventory with an explicit
+            # single-profile served set bound to this process identity and
+            # code revision. Release/cutover readers must never infer the
+            # runtime topology from config alone.
+            try:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(served_profiles=[active])
+            except Exception:
+                logger.debug("could not record served_profiles", exc_info=True)
+            return 0
+
         connected = 0
         # Resource claim -> profile that owns it. Credential claims prevent two
         # profiles polling the same account; listener claims prevent sidecars
@@ -28324,6 +28335,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                require_unclaimed_profile_turn,
+            )
+
+            require_unclaimed_profile_turn(
+                get_active_profile_name() or "default"
+            )
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,

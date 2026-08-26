@@ -63,9 +63,9 @@ export interface WaitForUpdateClearanceOptions {
  *
  * Returns 'clear' when the gate was already open (no wait happened),
  * 'finished' when it opened during the wait, and 'timeout' when the deadline
- * expired with the gate still closed (callers proceed anyway — matching the
- * long-standing marker-gate behavior, since a wedged updater must not brick
- * the app forever).
+ * expired with the gate still closed. Product callers treat timeout as a
+ * fail-closed operator-recovery error; it is never authority to start a
+ * backend under an unresolved update lease.
  */
 export async function waitForUpdateClearance(
   deps: UpdateGateDeps,

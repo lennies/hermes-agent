@@ -105,6 +105,11 @@ Multiple references in a single value work: `url: "${HOST}:${PORT}"`. If a refer
 
 Cursor-style SecretRef syntax is also accepted: `${env:VAR_NAME}` resolves exactly like `${VAR_NAME}` (the `env:` prefix is stripped), so MCP or provider snippets copied from Cursor / Claude configs work unchanged in both `config.yaml` and the `mcp_servers` block. Other SecretRef sources (`${file:...}`, `${vault:...}`, `${bitwarden:...}`) are **not** resolved inline — external secret backends inject their values into the environment at startup via the `secrets:` block, so reference them as `${env:NAME}` instead; unknown prefixes warn once and stay verbatim.
 
+The host-global `global_instructions_file` setting is the deliberate exception:
+it is read as a literal path before normal config merging and never expands
+`${...}` references. Use a literal absolute path or `~/...` so policy
+resolution is independent of environment and working directory.
+
 For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-hosted LLMs, fallback models, etc.), see [AI Providers](/integrations/providers).
 
 ### Provider Timeouts
@@ -699,6 +704,43 @@ Set a positive integer to pin a fixed cap instead of the dynamic behavior:
 ```yaml
 context_file_max_chars: 25000
 ```
+
+## Global Instructions File
+
+Use `global_instructions_file` for host-wide policy that every Hermes agent on
+an installation should receive, independently of its working directory:
+
+```yaml
+global_instructions_file: ~/.config/hermes/host-policy.md
+```
+
+The setting is empty by default, so hosted and custom installations without an
+explicit configuration receive no host-policy block. The value must be an
+absolute path or a path beginning with `~/`; plain relative paths and non-string
+values are rejected. `${...}` environment substitution is intentionally not
+supported for this security-sensitive path. Hermes resolves the final target, requires a non-empty
+regular file containing strict UTF-8, reads at most 500,000 bytes, verifies that
+the file did not change during the read, and includes its resolved path and
+SHA-256 digest as provenance. If a configured file is missing, unreadable,
+oversized, invalid, or unsafe to resolve, prompt construction stops with a
+configuration error.
+
+This key is intentionally read only from the default Hermes root config
+(normally `~/.hermes/config.yaml`). Every named profile receives that same
+host-wide source, but a named profile's own `config.yaml` may not contain the
+key. Profile clone, export, and import operations strip it so a portable profile
+cannot create or replace host policy on another installation.
+Named-profile config APIs report the effective shared value as read-only,
+reject attempts to change it, and never persist it into the profile file.
+
+The loaded block is frozen into the cached prompt. New sessions and explicit
+prompt rebuilds read the current file; a restored session keeps its previously
+stored prompt bytes. This preserves prompt-cache stability and is not a
+hot-reload mechanism.
+
+Portable session imports discard stored system prompts and rebuild them from
+the destination host on first resume. Conversation messages remain portable,
+but an archive cannot carry trusted policy provenance across hosts.
 
 ## File Read Safety
 

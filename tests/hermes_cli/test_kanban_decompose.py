@@ -59,7 +59,7 @@ def _patch_extra_body():
 def _patch_list_profiles(names: list[str]):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
-    profiles_mod.profile_exists() to resolve orchestrator/default."""
+    profiles_mod.profile_dispatch_allowed() to resolve orchestrator/default."""
     from types import SimpleNamespace
     fake_profiles = [
         SimpleNamespace(
@@ -70,9 +70,32 @@ def _patch_list_profiles(names: list[str]):
     ]
     return [
         patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
-        patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
+        patch(
+            "hermes_cli.profiles.profile_dispatch_allowed",
+            side_effect=lambda x: x in names,
+        ),
         patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
     ]
+
+
+def test_controller_only_profile_is_absent_from_decomposer_roster(kanban_home):
+    from types import SimpleNamespace
+
+    available = [
+        SimpleNamespace(name="default", description="general"),
+        SimpleNamespace(name="delivery-maintainer", description="delivery"),
+    ]
+    with (
+        patch("hermes_cli.profiles.list_profiles", return_value=available),
+        patch(
+            "hermes_cli.profiles.profile_dispatch_allowed",
+            side_effect=lambda name: name == "default",
+        ),
+    ):
+        roster, valid = decomp._build_roster()
+
+    assert [row["name"] for row in roster] == ["default"]
+    assert valid == {"default"}
 
 
 def test_decompose_with_fanout_creates_children(kanban_home):
@@ -159,5 +182,4 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
 

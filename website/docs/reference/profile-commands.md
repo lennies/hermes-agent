@@ -248,7 +248,7 @@ hermes profile rename mybot assistant
 hermes profile export <name> [options]
 ```
 
-Exports a profile as a compressed tar.gz archive — a portable snapshot you can back up, move to another machine, or hand to someone else. `auth.json` and `.env` are always excluded.
+Exports a profile as a compressed tar.gz archive — a portable snapshot you can back up, move to another machine, or hand to someone else. `auth.json` and `.env` are always excluded. The host-global `global_instructions_file` setting is stripped from exported config and from imported profiles; configure it separately in the destination installation's default Hermes root.
 
 Also available in chat as [`/export`](./slash-commands.md), and in the desktop app via **⌘K → Export profile…** or a profile square's right-click menu. A desktop export additionally stages `desktop.json` (skin, light/dark mode, custom themes, rail color, window layout) into the archive.
 

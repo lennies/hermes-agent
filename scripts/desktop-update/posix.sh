@@ -63,12 +63,14 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
 HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
+case "$HERMES_HOME" in */profiles/*) HERMES_HOME="$(dirname "$(dirname "$HERMES_HOME")")" ;; esac
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
 LOG_DIR="$HERMES_HOME/logs"; mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG="$LOG_DIR/desktop-update-handoff.log"
 RESULT="$HERMES_HOME/.hermes-update-result.json"
 STATUS="${TMPDIR:-/tmp}/hermes-update-status.$$"
 STARTED_AT="$(date +%s)"  # the shim's elapsed clock; see serve-ui.py
+LEASE_TOKEN="" LEASE_ID=""
 
 UI_SERVER_PID="" UI_BROWSER_PID="" FINAL_CODE=1
 FINAL_MSG="update did not complete"
@@ -429,8 +431,22 @@ finish() {
   [ "$FINAL_CODE" -eq 0 ] && [ -n "$DONE_NOTE" ] && { FINAL_MSG="$DONE_NOTE"; MANUAL=1; }
   write_result
 
-  if [ "$NO_MARKER_CLEANUP" -eq 0 ] && [ "$(head -1 "$MARKER" 2>/dev/null | tr -d '[:space:]')" = "$$" ]; then
-    rm -f "$MARKER" 2>/dev/null || true
+  if [ "$NO_MARKER_CLEANUP" -eq 0 ] && [ -n "$LEASE_TOKEN" ] && [ -n "$LEASE_ID" ]; then
+    /usr/bin/python3 - "$MARKER" "$$" "$STARTED_AT" "$LEASE_TOKEN" "$LEASE_ID" <<'PY' 2>/dev/null || true
+import os, sys
+path, pid, started, token, identity = sys.argv[1:]
+try:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        st = os.fstat(fd)
+        raw = os.read(fd, 1024).decode("ascii")
+    finally:
+        os.close(fd)
+    if f"{st.st_dev}:{st.st_ino}" == identity and raw == f"{pid}\n{started}\n{token}\n":
+        os.unlink(path)
+except (OSError, UnicodeError, IndexError):
+    pass
+PY
   fi
 
   if [ "$FINAL_CODE" -ne 0 ]; then
@@ -525,9 +541,9 @@ trap '' TERM
 log "hand-off start: root=$INSTALL_ROOT branch=$BRANCH desktopPid=$DESKTOP_PID pid=$$"
 rm -f "$RESULT" 2>/dev/null || true
 
-# Marker claim: same cross-process lock contract as windows.ps1 /
-# update_lock.py (the `hermes update` child adopts it via process ancestry).
-# The Desktop supplies one acquisition time for the whole ownership chain.
+# Marker claim: same create-new, fail-closed contract as windows.ps1 and
+# update_lock.py. The child adopts this exact PID/token handoff; no writer
+# replaces an existing lease.
 NOW="$(date +%s)"
 STARTED_AT="${HERMES_UPDATE_STARTED_AT:-$NOW}"
 case "$STARTED_AT" in ''|*[!0-9]*) STARTED_AT="$NOW" ;; esac
@@ -535,10 +551,51 @@ MIN_STARTED_AT=$((NOW - 1200))
 # Compare the validated decimal strings before doing arithmetic. Shell integer
 # expansion can wrap on an attacker-controlled value wider than signed 64-bit.
 if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
-    || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
+    || [ "$STARTED_AT" -gt "$NOW" ] \
+    || [ "$STARTED_AT" -lt "$MIN_STARTED_AT" ]; then
   STARTED_AT="$NOW"
 fi
-printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || log "WARNING: could not write update marker"
+LEASE_TOKEN="${HERMES_UPDATE_LEASE_TOKEN:-$$.$STARTED_AT.$RANDOM.$RANDOM}"
+LEASE_ID="$(/usr/bin/python3 - "$MARKER" "$$" "$STARTED_AT" "$LEASE_TOKEN" <<'PY'
+import os, sys
+path, pid, started, token = sys.argv[1:]
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        payload = f"{pid}\n{started}\n{token}\n".encode("ascii")
+        os.write(fd, payload)
+        os.fsync(fd)
+        st = os.fstat(fd)
+        verify_fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            verify_st = os.fstat(verify_fd)
+            published = b""
+            while len(published) < len(payload) + 1:
+                chunk = os.read(verify_fd, len(payload) + 1 - len(published))
+                if not chunk:
+                    break
+                published += chunk
+            if (verify_st.st_dev, verify_st.st_ino) != (st.st_dev, st.st_ino) or published != payload:
+                raise OSError("update marker publication could not be verified")
+        finally:
+            os.close(verify_fd)
+        print(f"{st.st_dev}:{st.st_ino}")
+    finally:
+        os.close(fd)
+except FileExistsError:
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(3)
+PY
+)"; CLAIM_CODE=$?
+if [ "$CLAIM_CODE" -ne 0 ] || [ -z "$LEASE_ID" ]; then
+  LEASE_TOKEN="" LEASE_ID=""
+  FINAL_CODE=2 FINAL_MSG="Update aborted: another updater owns the Hermes install lease. Nothing was changed."
+  log "$FINAL_MSG"
+  exit "$FINAL_CODE"
+fi
+export HERMES_UPDATE_HANDOFF_PID="$$"
+export HERMES_UPDATE_LEASE_TOKEN="$LEASE_TOKEN"
 
 if [ "$SELF_TEST_MARKER" -eq 1 ]; then
   trap - EXIT

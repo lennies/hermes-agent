@@ -11,12 +11,13 @@ def all_assignees_spawnable(monkeypatch):
 
     Most dispatcher tests use synthetic assignees ("alice", "bob") that
     don't correspond to actual profile directories on disk. Without this
-    patch, the dispatcher's profile-exists guard (PR #20105) routes
+    patch, the dispatcher's profile-dispatch guard routes
     those tasks into ``skipped_nonspawnable`` instead of spawning, which
     would break tests that assert spawn behavior.
     """
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(profiles, "profile_dispatch_allowed", lambda name: True)
 
 
 @pytest.fixture(autouse=True)

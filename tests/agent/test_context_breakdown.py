@@ -3,6 +3,15 @@
 from unittest.mock import MagicMock, patch
 
 from agent.context_breakdown import compute_session_context_breakdown
+from agent.system_prompt import (
+    extract_prompt_layout_snapshot,
+    format_prompt_layout_snapshot,
+)
+
+
+def _framed_prompt(parts: dict[str, str]) -> str:
+    body = "\n\n".join(parts[name] for name in ("stable", "context", "volatile") if parts[name])
+    return f"{body}\n\n{format_prompt_layout_snapshot(parts)}"
 
 
 def _make_agent(
@@ -32,14 +41,18 @@ def _make_agent(
 
 
 def test_breakdown_includes_major_categories():
-    stable = (
-        "base guidance\n"
-        "<available_skills>\n  demo:\n    - hello: hi\n</available_skills>"
-    )
+    stable = "base guidance"
     context = "# Project Context\nFollow AGENTS.md"
-    volatile = "Current time: now"
+    volatile_skills = "<available_skills>\n  demo:\n    - hello: hi\n</available_skills>"
+    volatile_other = "Conversation started: Monday, August 25, 2026"
+    volatile = f"{volatile_skills}\n\n{volatile_other}"
     history = [{"role": "user", "content": "hello there"}]
     agent, parts = _make_agent(stable=stable, context=context, volatile=volatile)
+    parts.update(
+        volatile_skills=volatile_skills,
+        volatile_memory="",
+        volatile_other=volatile_other,
+    )
 
     with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
         data = compute_session_context_breakdown(agent, history)
@@ -48,6 +61,121 @@ def test_breakdown_includes_major_categories():
     assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
     assert data["context_max"] == 200_000
     assert data["estimated_total"] > 0
+
+
+def test_breakdown_uses_active_cached_prompt_without_live_rebuild():
+    agent, _parts = _make_agent()
+    parts = {
+        "stable": "FROZEN STABLE V1",
+        "context": "# Project Context\nFROZEN RULES V1",
+        "volatile_skills": "<available_skills>FROZEN SKILL V1</available_skills>",
+        "volatile_memory": "<memory-context>FROZEN MEMORY V1</memory-context>",
+        "volatile_other": "Conversation started: Monday, August 25, 2026",
+    }
+    parts["volatile"] = "\n\n".join(
+        parts[name]
+        for name in ("volatile_skills", "volatile_memory", "volatile_other")
+    )
+    agent._cached_system_prompt_static = parts["stable"]
+    agent._cached_system_prompt = _framed_prompt(parts)
+
+    with patch(
+        "agent.system_prompt.build_system_prompt_parts",
+        side_effect=AssertionError("must not consult live policy/context"),
+    ):
+        data = compute_session_context_breakdown(agent, [])
+
+    categories = {item["id"]: item["tokens"] for item in data["categories"]}
+    assert categories["system_prompt"] > 0
+    assert categories["rules"] > 0
+    assert categories["skills"] > 0
+    assert categories["memory"] > 0
+
+
+def test_restored_breakdown_uses_frozen_tail_without_static_metadata():
+    agent, _parts = _make_agent()
+    agent._cached_system_prompt_static = None
+    agent._cached_system_prompt_context = None
+    agent._cached_system_prompt_volatile = None
+    parts = {
+        "stable": "FROZEN STABLE",
+        "context": (
+            "# Project Context\nFROZEN RULES\n"
+            "<available_skills>PROJECT LOOKALIKE</available_skills>\n"
+            "<memory-context>PROJECT LOOKALIKE</memory-context>\n"
+            "Conversation started: PROJECT LOOKALIKE"
+        ),
+        "volatile_skills": "<available_skills>FROZEN SKILL</available_skills>",
+        "volatile_memory": "<memory-context>FROZEN MEMORY</memory-context>",
+        "volatile_other": "Conversation started: Monday, August 25, 2026",
+    }
+    parts["volatile"] = "\n\n".join(
+        parts[name]
+        for name in ("volatile_skills", "volatile_memory", "volatile_other")
+    )
+    agent._cached_system_prompt = _framed_prompt(parts)
+    agent._memory_store = MagicMock()
+    agent._memory_store.format_for_system_prompt.return_value = "CURRENT MEMORY"
+
+    with patch(
+        "agent.system_prompt.build_system_prompt_parts",
+        side_effect=AssertionError("must not consult live policy/context"),
+    ):
+        data = compute_session_context_breakdown(agent, [])
+
+    categories = {item["id"]: item["tokens"] for item in data["categories"]}
+    assert categories["rules"] == (len(parts["context"]) + 3) // 4
+    assert categories["skills"] == (len("<available_skills>FROZEN SKILL</available_skills>") + 3) // 4
+    assert categories["memory"] == (len("<memory-context>FROZEN MEMORY</memory-context>") + 3) // 4
+    agent._memory_store.format_for_system_prompt.assert_not_called()
+
+
+def test_legacy_cached_prompt_is_reported_as_unclassified():
+    agent, _parts = _make_agent()
+    agent._cached_system_prompt = "LEGACY PROMPT WITHOUT LAYOUT"
+
+    data = compute_session_context_breakdown(agent, [])
+
+    categories = {item["id"]: item["tokens"] for item in data["categories"]}
+    assert categories["unclassified_prompt"] > 0
+    assert "rules" not in categories
+
+
+def test_prompt_layout_round_trips_exact_frozen_segments():
+    parts = {
+        "stable": "STABLE 🧝",
+        "context": "# Project Context\nRULES",
+        "volatile_skills": "<available_skills>SKILLS</available_skills>",
+        "volatile_memory": "<memory-context>MEMORY</memory-context>",
+        "volatile_other": "Conversation started: NOW",
+    }
+    parts["volatile"] = "\n\n".join(
+        parts[name]
+        for name in ("volatile_skills", "volatile_memory", "volatile_other")
+    )
+
+    assert extract_prompt_layout_snapshot(_framed_prompt(parts)) == parts
+
+
+def test_prompt_layout_tampering_fails_closed_to_unclassified():
+    parts = {
+        "stable": "FROZEN STABLE",
+        "context": "FROZEN CONTEXT",
+        "volatile": "FROZEN VOLATILE",
+        "volatile_skills": "",
+        "volatile_memory": "",
+        "volatile_other": "FROZEN VOLATILE",
+    }
+    agent, _ = _make_agent()
+    agent._cached_system_prompt = _framed_prompt(parts).replace(
+        "FROZEN CONTEXT", "FORGED CONTEXT", 1
+    )
+
+    data = compute_session_context_breakdown(agent, [])
+
+    categories = {item["id"]: item["tokens"] for item in data["categories"]}
+    assert categories["unclassified_prompt"] > 0
+    assert "rules" not in categories
 
 
 
@@ -124,5 +252,3 @@ def test_details_lines_caps_listing():
     }
     lines = render_context_details_lines(details)
     assert any("… and 5 more" in line for line in lines)
-
-

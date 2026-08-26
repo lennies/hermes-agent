@@ -105,6 +105,49 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     assert captured.get("max_in_progress") == 7
 
 
+def test_shared_dispatch_fails_closed_while_global_estop_is_engaged(
+    kanban_home, monkeypatch
+):
+    from agent import estop
+
+    spawns: list[str] = []
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="held", assignee="default")
+        estop.engage(reason="profile cutover")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            reconcile_orphans=False,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == []
+    assert spawns == []
+    assert task is not None and task.status == "ready"
+
+
+def test_run_daemon_cannot_bypass_global_estop(kanban_home, monkeypatch):
+    from agent import estop
+
+    spawns: list[str] = []
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="daemon held", assignee="default")
+    estop.engage(reason="profile cutover")
+    monkeypatch.setattr(kb, "_default_spawn", _fake_spawn_factory(spawns))
+    stop = threading.Event()
+
+    kb.run_daemon(
+        interval=0.01,
+        stop_event=stop,
+        on_tick=lambda _result: stop.set(),
+    )
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert spawns == []
+    assert task is not None and task.status == "ready"
+
+
 def test_configured_max_in_progress_parsing(monkeypatch):
     import hermes_cli.config as cfgmod
 
@@ -274,7 +317,7 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     )
     # Only 'alice' is a real profile; the review assignee is a human lane.
     monkeypatch.setattr(
-        profmod, "profile_exists", lambda name: name == "alice"
+        profmod, "profile_dispatch_allowed", lambda name: name == "alice"
     )
 
     spawns: list = []

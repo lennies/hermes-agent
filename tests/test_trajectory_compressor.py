@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
+from agent.prompt_builder import GlobalInstructionsError
 from trajectory_compressor import (
     CompressionConfig,
     TrajectoryMetrics,
@@ -52,6 +53,48 @@ def test_generate_summary_kimi_omits_temperature():
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in compressor.client.chat.completions.create.call_args.kwargs
+
+
+def test_generate_summary_direct_client_receives_trusted_policy():
+    config = CompressionConfig(max_retries=1)
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = config
+    compressor.logger = MagicMock()
+    compressor._use_call_llm = False
+    compressor.client = MagicMock()
+    compressor.client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: ok"))]
+    )
+    policy_messages = [
+        {"role": "system", "content": "# Trusted Host Policy\n\nFrozen."},
+        {"role": "user", "content": "summary task"},
+    ]
+
+    with patch(
+        "agent.auxiliary_client._auxiliary_messages_with_trusted_policy",
+        return_value=policy_messages,
+    ):
+        compressor._generate_summary("tool output", TrajectoryMetrics())
+
+    assert compressor.client.chat.completions.create.call_args.kwargs["messages"] is policy_messages
+
+
+def test_generate_summary_policy_error_is_not_serialized_as_fallback():
+    config = CompressionConfig(max_retries=1)
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = config
+    compressor.logger = MagicMock()
+    compressor._use_call_llm = False
+    compressor.client = MagicMock()
+
+    with patch(
+        "agent.auxiliary_client._auxiliary_messages_with_trusted_policy",
+        side_effect=GlobalInstructionsError("invalid host policy"),
+    ):
+        with pytest.raises(GlobalInstructionsError, match="invalid host policy"):
+            compressor._generate_summary("tool output", TrajectoryMetrics())
+
+    compressor.client.chat.completions.create.assert_not_called()
 
 
 
@@ -493,4 +536,3 @@ class TestCompressionNetSavingsGuard:
         assert compressed == trajectory
         assert sum(tc.count_turn_tokens(compressed)) == before
         tc._generate_summary.assert_not_called()
-

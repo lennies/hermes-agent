@@ -47,6 +47,20 @@ def _gateway_parser():
     return p
 
 
+def test_profile_dispatch_mode_parser_is_closed_and_readable():
+    parser = _profile_parser()
+    read = parser.parse_args(["profile", "dispatch-mode", "worker"])
+    assert read.profile_action == "dispatch-mode"
+    assert read.profile_name == "worker"
+    assert read.mode is None
+    assert read.func is _h_profile
+
+    write = parser.parse_args(
+        ["profile", "dispatch-mode", "worker", "controller-only"]
+    )
+    assert write.mode == "controller-only"
+
+
 
 
 

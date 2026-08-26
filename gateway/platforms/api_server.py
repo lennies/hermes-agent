@@ -2143,6 +2143,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     profile_allowlist=getattr(
                         cfg, "multiplex_profile_allowlist", None
                     ),
+                    generic_dispatch_only=True,
                 )
             }
         except Exception:
@@ -2860,6 +2861,19 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
         """
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            require_unclaimed_profile_turn,
+        )
+
+        # API/dashboard turns are generic, unclaimed work. Re-read the
+        # profile policy inside the resolved profile scope immediately before
+        # constructing an agent so a resident multiplex gateway cannot bypass
+        # a controller-only transition.
+        require_unclaimed_profile_turn(
+            get_active_profile_name() or "default"
+        )
+
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs,

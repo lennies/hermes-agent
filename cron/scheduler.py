@@ -2502,6 +2502,19 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
     job_id = job.get("id", "?")
     job_name = job.get("name", job_id)
 
+    try:
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            require_unclaimed_profile_turn,
+        )
+
+        target_profile = profile or get_active_profile_name() or "default"
+        require_unclaimed_profile_turn(target_profile)
+    except Exception as exc:
+        msg = f"bot-chat delivery refused: {exc}"
+        logger.warning("Job '%s': %s", job_id, msg)
+        return msg
+
     hermes_bin = _shutil.which("hermes")
     if hermes_bin:
         argv = [hermes_bin]
@@ -2653,11 +2666,19 @@ def _resolve_bot_chat_target(job: dict, profile_arg: str) -> Optional[dict]:
     ``~/.hermes/profiles/`` tree, so same-named profiles on other gateways
     can never be targeted by accident.
     """
-    if not profile_arg:
-        # Own profile: chat subprocess inherits HERMES_HOME, no name needed.
-        return {"platform": BOT_CHAT_PLATFORM, "chat_id": "", "thread_id": None}
     try:
-        from hermes_cli.profiles import normalize_profile_name, profile_exists
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            normalize_profile_name,
+            profile_exists,
+            require_unclaimed_profile_turn,
+        )
+
+        if not profile_arg:
+            own = get_active_profile_name() or "default"
+            require_unclaimed_profile_turn(own)
+            # Own profile: chat subprocess inherits HERMES_HOME, no name needed.
+            return {"platform": BOT_CHAT_PLATFORM, "chat_id": "", "thread_id": None}
 
         canon = normalize_profile_name(profile_arg)
         if not profile_exists(canon):
@@ -2667,11 +2688,12 @@ def _resolve_bot_chat_target(job: dict, profile_arg: str) -> Optional[dict]:
                 job.get("id", "?"), profile_arg,
             )
             return None
+        require_unclaimed_profile_turn(canon)
         return {"platform": BOT_CHAT_PLATFORM, "chat_id": canon, "thread_id": None}
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "Job '%s': failed to resolve bot-chat profile '%s'",
-            job.get("id", "?"), profile_arg, exc_info=True,
+            "Job '%s': refused bot-chat profile '%s': %s",
+            job.get("id", "?"), profile_arg or "(own)", exc,
         )
         return None
 
@@ -5350,6 +5372,13 @@ def run_job(
     # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
     # construction costs.
     # ---------------------------------------------------------------
+    from hermes_cli.profiles import (
+        get_active_profile_name,
+        require_unclaimed_profile_turn,
+    )
+
+    require_unclaimed_profile_turn(get_active_profile_name() or "default")
+
     from run_agent import AIAgent
 
     # Initialize SQLite session store so cron job messages are persisted

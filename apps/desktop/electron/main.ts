@@ -344,7 +344,12 @@ import {
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import {
+  readLiveUpdateMarker,
+  releaseWrittenUpdateMarker,
+  updateHandoffConflict,
+  writeUpdateMarker
+} from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
@@ -2051,8 +2056,8 @@ function directoryExists(filePath) {
 // fails with the 45s "backend didn't come up" error, and the relaunch/kill
 // cycle loops. Instead the fresh instance parks until the update finishes, then
 // brings the backend up itself (it is the surviving instance — the updater's
-// own relaunch hits our single-instance lock and quits). Marker parsing +
-// staleness self-heal live in update-marker.ts (unit-tested).
+// own relaunch hits our single-instance lock and quits). Marker parsing and
+// fail-closed operator recovery live in update-marker.ts (unit-tested).
 
 // How long we'll park the launch waiting for a live update to finish before
 // giving up and starting the backend anyway (belt-and-suspenders alongside the
@@ -2082,9 +2087,10 @@ function updateGateDeps() {
   }
 }
 
-// Block until no live update is in progress (or we hit the wait timeout).
+// Block until no update lease is present. The time limit is an error/reporting
+// boundary, never authority to start a backend under an unresolved lease.
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
-// rather than a frozen splash. Returns true if it parked at all.
+// rather than a frozen splash. Returns true if it parked and then cleared.
 async function waitForUpdateToFinish() {
   let announced = false
 
@@ -2104,6 +2110,12 @@ async function waitForUpdateToFinish() {
     pollMs: UPDATE_WAIT_POLL_MS,
     timeoutMs: UPDATE_WAIT_TIMEOUT_MS
   })
+
+  if (outcome === 'timeout') {
+    throw new Error(
+      'The Hermes update lease did not clear. Confirm that no update is running before removing .hermes-update-in-progress.'
+    )
+  }
 
   // The detached hand-off script (scripts/desktop-update/windows.ps1) runs hidden;
   // its result file is the ONLY way the user learns a detached update
@@ -2142,11 +2154,7 @@ async function waitForUpdateToFinish() {
     return false
   }
 
-  if (outcome === 'timeout') {
-    rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
-  } else {
-    rememberLog('[updates] update finished; proceeding with backend start')
-  }
+  rememberLog('[updates] update finished; proceeding with backend start')
 
   return true
 }
@@ -3798,16 +3806,9 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         stdio: 'ignore'
       })
 
-      // Bridge marker: child.pid is the short-lived cmd.exe WRAPPER, not the
-      // script (see wrapHandoffForDetachedConsole). Write it anyway to cover
-      // the first moments of the hand-off — the script's step 0 overwrites it
-      // with its own live $PID, and if the script never starts the wrapper's
-      // dead pid makes the marker read as stale and self-delete (no wedge).
-      // The `hermes update` child adopts the SCRIPT's claim via
-      // update_lock.py's process-ancestry rule; no mtime heuristics needed.
-      if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
-      }
+      // The wrapper PID is not the PowerShell owner. The script claims the
+      // lease atomically with its own PID before touching the install; a
+      // bridge overwrite here would violate the single-writer contract.
 
       rememberLog(
         `[updates] launched repo hand-off script: ${scriptHandoff.scriptPath} (branch ${branch}); exiting desktop to release venv shim`
@@ -3840,7 +3841,19 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // strictly better than never updating again, and the updater still writes
       // its own marker moments later.
       if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-        writeUpdateMarker(HERMES_HOME, child.pid)
+        if (!writeUpdateMarker(HERMES_HOME, child.pid)) {
+          try {
+            child.kill?.()
+          } catch {
+            void 0
+          }
+
+          const message = 'Update aborted: another updater won the install lease. Nothing was changed.'
+          emitUpdateProgress({ stage: 'error', message, percent: null })
+          startHermes().catch(() => {})
+
+          return { ok: false, error: 'update-already-running', message }
+        }
       } else if (Number.isInteger(child.pid)) {
         rememberLog(
           `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
@@ -3862,12 +3875,16 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // detached child for an async spawn `error` (ENOENT/EACCES) or an early
     // non-zero/signal exit. On failure, DON'T quit — the user would be left
     // with no app, no updater, and no evidence. Restart our backend and
-    // surface the error instead. The pre-written marker names the dead child
-    // pid, so readLiveUpdateMarker self-heals it; no cleanup needed.
+    // surface the error instead. Release only the exact marker claim this
+    // Electron process successfully wrote; unknown/changed claims stay closed.
     const dwellStartedAt = Date.now()
     const handoffOutcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
 
     if (!handoffOutcome.ok) {
+      if (Number.isInteger(child.pid)) {
+        releaseWrittenUpdateMarker(HERMES_HOME, child.pid)
+      }
+
       const message = `Update failed to start: ${handoffOutcome.message}. Hermes will keep running — try again, or run \`hermes update\` from a terminal.`
 
       rememberLog(`[updates] hand-off not viable, aborting quit: ${handoffOutcome.message}`)
@@ -3965,7 +3982,17 @@ async function handOffWindowsBootstrapRecovery(reason) {
   // exclusion: a pre-#74782 binary would refuse its own pre-written claim and
   // strand the very recovery meant to heal the install.
   if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-    writeUpdateMarker(HERMES_HOME, child.pid)
+    if (!writeUpdateMarker(HERMES_HOME, child.pid)) {
+      try {
+        child.kill?.()
+      } catch {
+        void 0
+      }
+
+      rememberLog('[bootstrap] recovery hand-off lost the atomic update lease')
+
+      return false
+    }
   } else if (Number.isInteger(child.pid)) {
     rememberLog(
       `[bootstrap] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
@@ -3985,6 +4012,10 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const handoffOutcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
 
   if (!handoffOutcome.ok) {
+    if (Number.isInteger(child.pid)) {
+      releaseWrittenUpdateMarker(HERMES_HOME, child.pid)
+    }
+
     rememberLog(`[bootstrap] recovery hand-off not viable, staying alive: ${handoffOutcome.message}`)
 
     return false
@@ -4189,12 +4220,9 @@ async function applyUpdatesPosixHandoff(opts: any) {
     stdio: 'ignore'
   })
 
-  // Bridge marker (same contract as the Windows hand-off): cover the gap
-  // until the script claims the marker with its own pid as step 0. If the
-  // script never starts, the dead pid reads as stale and self-deletes.
-  if (Number.isInteger(child.pid)) {
-    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
-  }
+  // The script claims the lease atomically with its own PID before it touches
+  // the install. A pre-write followed by replacement would create a TOCTOU
+  // window and could clobber a concurrent owner.
 
   rememberLog(`[updates] launched posix hand-off: ${handoff.scriptPath} (branch ${branch}); quitting to hand off`)
   emitUpdateProgress({
@@ -10920,7 +10948,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   {
     let poolAnnounced = false
 
-    await waitForUpdateClearance(updateGateDeps(), {
+    const outcome = await waitForUpdateClearance(updateGateDeps(), {
       onWaitTick: reason => {
         if (!poolAnnounced) {
           poolAnnounced = true
@@ -10930,6 +10958,10 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
       pollMs: UPDATE_WAIT_POLL_MS,
       timeoutMs: UPDATE_WAIT_TIMEOUT_MS
     })
+
+    if (outcome === 'timeout') {
+      throw new Error(`The Hermes update lease did not clear; refusing to start pool backend for profile "${profile}".`)
+    }
   }
 
   profileDeletionGate.assertCanStart(profile)

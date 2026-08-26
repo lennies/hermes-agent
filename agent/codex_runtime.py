@@ -714,9 +714,13 @@ def run_codex_app_server_turn(
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
+        from agent.prompt_builder import extract_trusted_policy_snapshot
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        frozen_policy = extract_trusted_policy_snapshot(
+            getattr(agent, "_cached_system_prompt", None)
+        )
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -756,6 +760,9 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            developer_instructions=(
+                frozen_policy.policy_block if frozen_policy is not None else None
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

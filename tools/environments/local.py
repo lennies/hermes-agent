@@ -383,6 +383,10 @@ def _is_hermes_internal_secret(key: str) -> bool:
       ``_ALWAYS_STRIP_KEYS``. Non-secret ``GATEWAY_RELAY_*`` routing hints
       (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
       and remain visible.
+    - ``REPOSITORY_DELIVERY_BROKER_FD`` — the inherited descriptor number for
+      a claim-bound supervisor channel. The role process may use it directly;
+      model-authored terminal/process children must not learn or propagate the
+      capability hint even if a child descriptor were accidentally inherited.
 
     ``code_execution_tool.py`` already catches these via substring matching on
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
@@ -397,6 +401,8 @@ def _is_hermes_internal_secret(key: str) -> bool:
     a model-driving CLI legitimately needs matches these patterns.
     """
     upper = key.upper()
+    if upper == "REPOSITORY_DELIVERY_BROKER_FD":
+        return True
     if upper.startswith("AUXILIARY_") and (
         upper.endswith("_API_KEY") or upper.endswith("_BASE_URL")
     ):

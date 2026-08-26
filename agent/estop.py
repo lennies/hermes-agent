@@ -43,10 +43,15 @@ _logged_components: set[str] = set()
 
 
 def _hermes_home() -> Path:
-    """Resolve the active HERMES_HOME (profile-aware) at call time."""
+    """Resolve the install-global Hermes root at call time.
+
+    ESTOP is a host-wide new-work fence. A named profile must observe the
+    same sentinel as the default profile; profile-local sentinels would let
+    ``hermes -p <name> kanban dispatch`` bypass a global pause.
+    """
     try:
-        from hermes_constants import get_hermes_home
-        return get_hermes_home()
+        from hermes_constants import get_default_hermes_root
+        return get_default_hermes_root()
     except Exception:
         return Path(os.path.expanduser("~/.hermes"))
 

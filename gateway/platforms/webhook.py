@@ -601,6 +601,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     profile_allowlist=getattr(
                         cfg, "multiplex_profile_allowlist", None
                     ),
+                    generic_dispatch_only=True,
                 )
             }
         except Exception:

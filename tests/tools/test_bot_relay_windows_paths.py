@@ -95,6 +95,10 @@ def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
     sibling.touch()
     sibling.chmod(0o755)
     monkeypatch.setattr("sys.executable", str(bin_dir / "python"))
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_dispatch_allowed",
+        lambda _name, **_kwargs: True,
+    )
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == str(sibling)
@@ -112,6 +116,10 @@ def test_local_delivery_uses_shutil_which_when_no_sibling(tmp_path, monkeypatch)
     monkeypatch.setattr(
         bot_relay.shutil, "which", lambda name: which_hit if name == "hermes" else None
     )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_dispatch_allowed",
+        lambda _name, **_kwargs: True,
+    )
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == which_hit
@@ -122,6 +130,10 @@ def test_local_delivery_falls_back_to_bare_name(tmp_path, monkeypatch):
     empty.mkdir(parents=True)
     monkeypatch.setattr("sys.executable", str(empty / "python"))
     monkeypatch.setattr(bot_relay.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_dispatch_allowed",
+        lambda _name, **_kwargs: True,
+    )
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == "hermes"

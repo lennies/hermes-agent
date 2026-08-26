@@ -9,8 +9,9 @@ fork inherits the cached prompt verbatim.
 
 Three tiers are joined with ``\\n\\n``:
 
-* ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
-  guidance, computer-use guidance, nous subscription block, tool-use
+* ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), optional
+  default-root trusted host policy, tool guidance, computer-use guidance,
+  nous subscription block, tool-use
   enforcement guidance + per-model operational guidance,
   alibaba model-name workaround, environment hints, coding guidance,
   platform hints.
@@ -25,11 +26,128 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+
+
+_PROMPT_LAYOUT_START = "<!-- hermes:prompt-layout:v1 "
+_PROMPT_LAYOUT_END = " -->"
+_PROMPT_LAYOUT_SEGMENTS = (
+    "stable",
+    "context",
+    "volatile",
+    "volatile_skills",
+    "volatile_memory",
+    "volatile_other",
+)
+
+
+def _canonical_prompt_layout(metadata: Dict[str, Any]) -> str:
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _prompt_layout_digest(metadata: Dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in metadata.items() if key != "metadata_sha256"}
+    return hashlib.sha256(_canonical_prompt_layout(unsigned).encode("ascii")).hexdigest()
+
+
+def _join_prompt_segments(parts: Dict[str, str], names: tuple[str, ...]) -> str:
+    return "\n\n".join(parts.get(name, "") for name in names if parts.get(name, ""))
+
+
+def format_prompt_layout_snapshot(parts: Dict[str, str]) -> str:
+    """Return an end-anchored, hash-verified layout frame for frozen tiers."""
+    volatile = parts.get("volatile", "")
+    subsegments = _join_prompt_segments(
+        parts, ("volatile_skills", "volatile_memory", "volatile_other")
+    )
+    if volatile != subsegments:
+        raise ValueError("volatile prompt subsegments do not reconstruct volatile tier")
+    metadata: Dict[str, Any] = {}
+    for name in _PROMPT_LAYOUT_SEGMENTS:
+        raw = parts.get(name, "").encode("utf-8")
+        metadata[f"{name}_bytes"] = len(raw)
+        metadata[f"{name}_sha256"] = hashlib.sha256(raw).hexdigest()
+    metadata["metadata_sha256"] = _prompt_layout_digest(metadata)
+    return f"{_PROMPT_LAYOUT_START}{_canonical_prompt_layout(metadata)}{_PROMPT_LAYOUT_END}"
+
+
+def _extract_joined_segments(
+    raw: bytes,
+    names: tuple[str, ...],
+    metadata: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    present = [name for name in names if metadata[f"{name}_bytes"] > 0]
+    cursor = len(raw)
+    extracted: Dict[str, str] = {name: "" for name in names}
+    for index, name in enumerate(reversed(present)):
+        size = metadata[f"{name}_bytes"]
+        start = cursor - size
+        if start < 0:
+            return None
+        segment = raw[start:cursor]
+        if hashlib.sha256(segment).hexdigest() != metadata[f"{name}_sha256"]:
+            return None
+        try:
+            extracted[name] = segment.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        cursor = start
+        if index < len(present) - 1:
+            if cursor < 2 or raw[cursor - 2:cursor] != b"\n\n":
+                return None
+            cursor -= 2
+    return extracted if cursor == 0 else None
+
+
+def extract_prompt_layout_snapshot(prompt: str) -> Optional[Dict[str, str]]:
+    """Recover exact frozen prompt tiers from the core-owned terminal frame."""
+    terminator = _PROMPT_LAYOUT_END.encode("ascii")
+    raw = prompt.encode("utf-8")
+    prefix = ("\n\n" + _PROMPT_LAYOUT_START).encode("ascii")
+    frame_start = raw.rfind(prefix)
+    if frame_start < 0 or not raw.endswith(terminator):
+        return None
+    payload_start = frame_start + len(prefix)
+    payload = raw[payload_start:-len(terminator)]
+    if len(payload) > 4096:
+        return None
+    try:
+        metadata = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    expected_keys = {"metadata_sha256"}
+    for name in _PROMPT_LAYOUT_SEGMENTS:
+        expected_keys.update({f"{name}_bytes", f"{name}_sha256"})
+    if not isinstance(metadata, dict) or set(metadata) != expected_keys:
+        return None
+    if payload.decode("ascii") != _canonical_prompt_layout(metadata):
+        return None
+    if metadata.get("metadata_sha256") != _prompt_layout_digest(metadata):
+        return None
+    for name in _PROMPT_LAYOUT_SEGMENTS:
+        size = metadata.get(f"{name}_bytes")
+        digest = metadata.get(f"{name}_sha256")
+        if type(size) is not int or size < 0 or not isinstance(digest, str) or len(digest) != 64:
+            return None
+    tiers = _extract_joined_segments(
+        raw[:frame_start], ("stable", "context", "volatile"), metadata
+    )
+    if tiers is None:
+        return None
+    volatile_parts = _extract_joined_segments(
+        tiers["volatile"].encode("utf-8"),
+        ("volatile_skills", "volatile_memory", "volatile_other"),
+        metadata,
+    )
+    if volatile_parts is None:
+        return None
+    tiers.update(volatile_parts)
+    return tiers
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
@@ -50,7 +168,12 @@ from agent.prompt_builder import (
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    TrustedPolicySnapshotKind,
     drain_truncation_warnings,
+    inspect_trusted_policy_snapshot,
+    load_global_instructions_file,
+    render_frozen_trusted_policy_prefix,
+    render_trusted_policy_prefix,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -391,6 +514,29 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Host-wide policy is resolved from the default Hermes root, even for a
+    # named profile. It is independent of cwd project discovery and therefore
+    # remains present for automations that set skip_context_files.
+    global_instructions = None
+    frozen_policy = getattr(agent, "_trusted_policy_snapshot_state", None)
+    if frozen_policy is not None:
+        # A session-bound rebuild must use the integrity-verified startup
+        # snapshot. In particular, explicit absence stays absent and a corrupt
+        # configured frame fails closed instead of silently hot-loading disk.
+        stable_parts[0] = render_frozen_trusted_policy_prefix(
+            stable_parts[0], frozen_policy
+        )
+    else:
+        global_instructions = load_global_instructions_file(
+            active_home=_agent_home(agent)
+        )
+        # The renderer owns the entire byte-zero prefix, including an explicit
+        # policy-absent envelope. Keeping identity + policy in one stable part
+        # preserves the frozen provenance offsets across prompt reassembly.
+        stable_parts[0] = render_trusted_policy_prefix(
+            stable_parts[0], global_instructions
+        )
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes
     # itself. When the session has no skill tools (Blank Slate with the skills
@@ -799,16 +945,36 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
+        context_kwargs = {}
+        if global_instructions:
+            context_kwargs = {
+                "excluded_resolved_paths": {global_instructions.resolved_path},
+                "excluded_content_digests": {global_instructions.sha256},
+            }
+        elif (
+            frozen_policy is not None
+            and frozen_policy.kind is TrustedPolicySnapshotKind.CONFIGURED
+            and frozen_policy.configured is not None
+        ):
+            context_kwargs = {
+                "excluded_resolved_paths": {frozen_policy.configured.resolved_path},
+                "excluded_content_digests": {
+                    frozen_policy.configured.source_sha256
+                },
+            }
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent))
+            home_override=_agent_home(agent),
+            **context_kwargs)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
-    volatile_parts: List[str] = []
+    volatile_skills_parts: List[str] = []
+    volatile_memory_parts: List[str] = []
+    volatile_other_parts: List[str] = []
     # Skills are runtime-mutable: the agent adds and patches them across a
     # session (SKILLS_GUIDANCE tells it to patch a skill the moment it goes
     # stale). The built prompt is cached per session and only rebuilt on
@@ -822,18 +988,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (No effect for single-block cache_control backends, where the whole
     # system message is one cache unit regardless of internal order.)
     if skills_prompt:
-        volatile_parts.append(skills_prompt)
+        volatile_skills_parts.append(skills_prompt)
 
     if agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
-                volatile_parts.append(mem_block)
+                volatile_memory_parts.append(mem_block)
         # USER.md is always included when enabled.
         if agent._user_profile_enabled:
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
-                volatile_parts.append(user_block)
+                volatile_memory_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in).
     # Gated on the same check ``inject_memory_provider_tools`` uses so we
@@ -848,14 +1014,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             try:
                 _ext_mem_block = agent._memory_manager.build_system_prompt()
                 if _ext_mem_block:
-                    volatile_parts.append(_ext_mem_block)
+                    volatile_memory_parts.append(_ext_mem_block)
             except Exception:
                 pass
 
     # Plugin sections are intentionally confined to one coarse anchor in the
     # volatile tail. This preserves deterministic ordering and lets a resumed
     # process reconstruct the stable cache prefix without re-running plugins.
-    volatile_parts.extend(
+    volatile_other_parts.extend(
         _plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory")
     )
 
@@ -906,12 +1072,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
-    volatile_parts.append(timestamp_line)
+    volatile_other_parts.append(timestamp_line)
+
+    volatile_skills = "\n\n".join(
+        part.strip() for part in volatile_skills_parts if part and part.strip()
+    )
+    volatile_memory = "\n\n".join(
+        part.strip() for part in volatile_memory_parts if part and part.strip()
+    )
+    volatile_other = "\n\n".join(
+        part.strip() for part in volatile_other_parts if part and part.strip()
+    )
+    volatile = "\n\n".join(
+        part for part in (volatile_skills, volatile_memory, volatile_other) if part
+    )
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
-        "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
+        "volatile": volatile,
+        "volatile_skills": volatile_skills,
+        "volatile_memory": volatile_memory,
+        "volatile_other": volatile_other,
     }
 
 
@@ -933,8 +1115,20 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     the change stays in the reused prefix.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
-    joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    prompt_body = "\n\n".join(
+        p for p in (parts["stable"], parts["context"], parts["volatile"]) if p
+    )
+    joined = f"{prompt_body}\n\n{format_prompt_layout_snapshot(parts)}"
+    agent._trusted_policy_snapshot_state = inspect_trusted_policy_snapshot(joined)
     agent._cached_system_prompt_static = parts["stable"]
+    agent._cached_system_prompt_context = parts["context"]
+    agent._cached_system_prompt_volatile = parts["volatile"]
+    subdirectory_hints = getattr(agent, "_subdirectory_hints", None)
+    if subdirectory_hints is not None:
+        # Seed only from the final anchored snapshot. Static-prefix
+        # reconstruction may build candidate parts that are rejected in favor
+        # of an older stored snapshot and must not mutate these exclusions.
+        subdirectory_hints.seed_exclusions_from_prompt_snapshot(joined)
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
@@ -950,8 +1144,18 @@ def invalidate_system_prompt(agent: Any) -> None:
     Called after context compression events. Also reloads memory from disk
     so the rebuilt prompt captures any writes from this session.
     """
+    cached_prompt = getattr(agent, "_cached_system_prompt", None)
+    if isinstance(cached_prompt, str) and cached_prompt:
+        snapshot = inspect_trusted_policy_snapshot(cached_prompt)
+        if snapshot.kind is not TrustedPolicySnapshotKind.INVALID or snapshot.frame_present:
+            # Legacy unframed prompts remain rebuild-compatible. Any prompt
+            # that claims the trusted snapshot namespace must verify or stay
+            # INVALID so the next rebuild fails closed.
+            agent._trusted_policy_snapshot_state = snapshot
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
+    agent._cached_system_prompt_context = None
+    agent._cached_system_prompt_volatile = None
     if agent._memory_store:
         agent._memory_store.load_from_disk()
 

@@ -1142,6 +1142,61 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
 # ---------------------------------------------------------------------------
 
 
+def test_controller_only_profile_never_generic_dispatches_ready_or_review(kanban_home):
+    from hermes_cli.profiles import create_profile, set_profile_dispatch_mode
+
+    profile = "delivery-maintainer"
+    create_profile(profile, no_alias=True, no_skills=True)
+    set_profile_dispatch_mode(profile, "controller-only")
+
+    with kb.connect() as conn:
+        ready_id = kb.create_task(conn, title="build", assignee=profile)
+        review_id = kb.create_task(conn, title="review", assignee=profile)
+        claimed = kb.claim_task(conn, review_id)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            review_id,
+            summary="ready",
+            expected_run_id=claimed.current_run_id,
+        )
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert result.spawned == []
+    assert set(result.skipped_nonspawnable) == {ready_id, review_id}
+
+
+def test_profile_policy_import_failure_blocks_ready_and_review_dispatch(
+    kanban_home, monkeypatch
+):
+    import builtins
+
+    with kb.connect() as conn:
+        ready_id = kb.create_task(conn, title="build", assignee="worker")
+        review_id = kb.create_task(conn, title="review", assignee="worker")
+        claimed = kb.claim_task(conn, review_id)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            review_id,
+            summary="ready",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "hermes_cli.profiles":
+                raise ImportError("simulated partial profile policy install")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert result.spawned == []
+    assert set(result.skipped_nonspawnable) == {ready_id, review_id}
+
+
 def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeypatch):
     """When the shim is not on PATH, fall back to `python -m hermes_cli.main`.
 
@@ -1244,6 +1299,118 @@ def _make_task(**overrides) -> "kb.Task":
 # ---------------------------------------------------------------------------
 # dispatch_once — max_in_progress
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_dispatch_releases_unspawned_claim_when_estop_engages_during_workspace(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path, lane,
+):
+    """A pause during workspace I/O must close the run without a failure."""
+    from agent import estop
+
+    workspace = tmp_path / (lane + "-workspace")
+    workspace.mkdir()
+    spawn_calls = []
+
+    def resolve_and_pause(task, *, board=None):
+        estop.engage(reason="dispatch boundary regression")
+        return workspace
+
+    monkeypatch.setattr(kb, "resolve_workspace", resolve_and_pause)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=lane, assignee="alice")
+        if lane == "review":
+            _set_task_status(conn, task_id, "review")
+        try:
+            result = kb.dispatch_once(
+                conn,
+                spawn_fn=lambda task, path, board=None: spawn_calls.append(task.id),
+            )
+        finally:
+            estop.disengage()
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT outcome, status FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert task is not None
+    assert task.status == lane
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert task.consecutive_failures == 0
+    assert run is not None and run["outcome"] == "dispatch_paused"
+    assert run["status"] == "dispatch_paused"
+    assert event is not None and event["kind"] == "dispatch_paused"
+
+
+def test_default_spawn_reports_admitted_child_when_estop_closes_across_popen(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """The production Popen boundary reports work that is already in-flight."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="spawn race", assignee="alice")
+        task = kb.get_task(conn, task_id)
+
+    allowed = iter((True, False))
+    monkeypatch.setattr(kb, "new_work_dispatch_allowed", lambda: next(allowed))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: [])
+    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda root: None)
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda name: str(kanban_home))
+
+    class FakeProcess:
+        pid = 424242
+
+    process = FakeProcess()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(kb._DispatchPausedDuringSpawn) as raised:
+        kb._default_spawn(task, str(workspace))
+
+    assert raised.value.pid == process.pid
+    assert raised.value.terminated is False
+
+
+def test_dispatch_retains_claim_when_estop_engages_after_spawn(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A worker admitted at the ESTOP edge stays claimed as in-flight work."""
+    from agent import estop
+
+    def spawn_and_pause(task, workspace, board=None):
+        estop.engage(reason="post-spawn boundary regression")
+        return 424242
+
+    monkeypatch.setattr(kb, "_fire_worker_spawned_hook", lambda *args, **kwargs: None)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="post-spawn", assignee="alice")
+        try:
+            result = kb.dispatch_once(conn, spawn_fn=spawn_and_pause)
+        finally:
+            estop.disengage()
+        task = kb.get_task(conn, task_id)
+        event = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert result.spawned == [(task_id, "alice", task.workspace_path)]
+    assert task is not None
+    assert task.status == "running"
+    assert task.claim_lock is not None
+    assert task.current_run_id is not None
+    assert task.worker_pid == 424242
+    assert event is not None and event["kind"] == "dispatch_pause_race_admitted"
 
 
 def test_dispatch_max_in_progress_blocks_review_when_at_limit(

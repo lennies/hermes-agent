@@ -6,7 +6,7 @@ description: "Project context files — .hermes.md, AGENTS.md, CLAUDE.md, global
 
 # Context Files
 
-Hermes Agent automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is now global to the Hermes instance and is loaded from `HERMES_HOME` only.
+Hermes Agent automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is profile-local identity loaded from `HERMES_HOME`. An optional [`global_instructions_file`](../configuration.md#global-instructions-file) is separate host-wide policy loaded from the default Hermes root.
 
 ## Supported Context Files
 
@@ -16,14 +16,24 @@ Hermes Agent automatically discovers and loads context files that shape how it b
 | **AGENTS.override.md** | Personal, per-directory override of AGENTS.md (typically gitignored) | CWD at startup + subdirectories progressively |
 | **AGENTS.md** | Project instructions, conventions, architecture | CWD at startup + subdirectories progressively |
 | **CLAUDE.md** | Claude Code context files (also detected) | CWD at startup + subdirectories progressively |
-| **SOUL.md** | Global personality and tone customization for this Hermes instance | `HERMES_HOME/SOUL.md` only |
+| **SOUL.md** | Profile personality and tone customization for this Hermes instance | `HERMES_HOME/SOUL.md` only |
+| **Configured global instructions** | Host-wide policy shared by every local profile | Path in the default root `config.yaml` only |
 | **.cursorrules** | Cursor IDE coding conventions | CWD only |
 | **.cursor/rules/*.mdc** | Cursor IDE rule modules | CWD only |
 
 :::info Priority system
-Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
+Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is loaded independently as profile identity. Configured global instructions are also independent and appear in a distinct `# Trusted Host Policy` block before project context, even when project-context loading is disabled.
 
 If an `AGENTS.override.md` exists next to an `AGENTS.md`, the override is loaded **instead of** the committed file — keep a personal (usually gitignored) `AGENTS.override.md` when you want different instructions than the ones checked into the repo, without editing the tracked `AGENTS.md`.
+
+When the configured global file is also found as project context, Hermes omits
+the duplicate by resolved path and then by exact byte digest. A skipped
+`AGENTS.override.md` falls through to the next `AGENTS.md` candidate. This keeps
+host provenance separate from lower-trust project instructions, which may
+describe the project but cannot expand host authorization or weaken runtime
+security boundaries. The same exclusions apply to context discovered
+progressively after tool navigation, including restored sessions that retain a
+cached prompt.
 :::
 
 ## AGENTS.md

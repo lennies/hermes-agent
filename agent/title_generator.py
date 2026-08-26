@@ -17,6 +17,7 @@ user typed. That ordering is the industry-standard one — Codex CLI encodes the
 same ``custom > ai > fallback`` precedence in its session importer.
 """
 
+import contextvars
 import json
 import logging
 import re
@@ -747,9 +748,10 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    dispatch_context = contextvars.copy_context()
     thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message),
+        target=dispatch_context.run,
+        args=(auto_title_session, session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,
