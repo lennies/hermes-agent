@@ -245,6 +245,8 @@ def test_rust_and_windows_sources_use_create_new_and_identity_cleanup():
     assert "[System.IO.FileMode]::CreateNew" in powershell
     assert "$script:LeasePayload" in powershell
     assert "$script:LeaseStream" in powershell
-    assert "[System.IO.FileOptions]::DeleteOnClose" in powershell
+    assert "[System.IO.FileOptions]::DeleteOnClose" not in powershell
+    assert "[System.IO.FileShare]::Delete" in powershell
+    assert "removed update marker (verified owned handle)" in powershell
     assert "[System.IO.FileAccess]::ReadWrite" in powershell
     assert "WriteAllText($MarkerPath" not in powershell

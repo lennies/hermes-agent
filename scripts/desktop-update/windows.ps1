@@ -39,8 +39,11 @@
 # immediately), retaining HERMES_UPDATE_STARTED_AT from the Desktop hand-off.
 # hermes_cli/update_lock.py requires our exact PID/token handoff;
 # electron/update-marker.ts parks a relaunched Desktop on it. CreateNew fails
-# closed, and production cleanup disposes the exact identity-binding kernel
-# handle acquired with DeleteOnClose.
+# closed. Production cleanup deletes through a second identity-binding kernel
+# handle only after re-reading the exact payload owned by this process. The
+# primary handle cannot use DeleteOnClose: Windows marks that pathname delete-
+# pending immediately, which prevents the Python child from reading and
+# adopting the exact PID/token handoff.
 
 param(
     [string]$InstallRoot,
@@ -531,22 +534,70 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
 }
 
 function Remove-MarkerIfOwned {
+    $ownedStream = $null
+    $cleanupStream = $null
     try {
         if ($script:LeaseStream) {
-            # Production claims use DeleteOnClose and deny delete/write
-            # sharing. The open kernel handle is the file identity: another
-            # process cannot replace the pathname before this exact handle is
-            # disposed. Test-only NoMarkerCleanup omits DeleteOnClose so the
-            # same dispose intentionally leaves its fixture behind.
-            $script:LeaseStream.Dispose()
+            # The primary handle denies delete/write sharing for the whole
+            # update while allowing the Python child to read and adopt the
+            # exact PID/token payload. Re-verify through that handle before
+            # releasing it; a mismatched claim is never deleted.
+            $ownedStream = $script:LeaseStream
             $script:LeaseStream = $null
+            $ownedBytes = [System.Text.Encoding]::ASCII.GetBytes($script:LeasePayload)
+            $ownedStream.Position = 0
+            $observed = New-Object byte[] $ownedBytes.Length
+            $read = $ownedStream.Read($observed, 0, $observed.Length)
+            if ($read -ne $ownedBytes.Length -or $ownedStream.Length -ne $ownedBytes.Length) {
+                throw "owned update marker length changed before cleanup"
+            }
+            for ($i = 0; $i -lt $ownedBytes.Length; $i++) {
+                if ($observed[$i] -ne $ownedBytes[$i]) {
+                    throw "owned update marker payload changed before cleanup"
+                }
+            }
+            $ownedStream.Dispose()
+            $ownedStream = $null
+
             if ($NoMarkerCleanup) {
                 Write-HandoffLog "leaving update marker (test fixture)"
             } else {
-                Write-HandoffLog "removed update marker (owned handle)"
+                # Re-open exclusively except for delete sharing, re-read the
+                # same payload, then delete while this exact handle remains
+                # open. Compliant contenders cannot replace the live claim in
+                # the small close/re-open interval: the marker still names our
+                # live PID and their create-new acquisition fails closed.
+                $cleanupStream = [System.IO.FileStream]::new(
+                    $MarkerPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete),
+                    4096,
+                    [System.IO.FileOptions]::None
+                )
+                $cleanupStream.Position = 0
+                $cleanupObserved = New-Object byte[] $ownedBytes.Length
+                $cleanupRead = $cleanupStream.Read($cleanupObserved, 0, $cleanupObserved.Length)
+                if ($cleanupRead -ne $ownedBytes.Length -or $cleanupStream.Length -ne $ownedBytes.Length) {
+                    throw "owned update marker length changed during cleanup"
+                }
+                for ($i = 0; $i -lt $ownedBytes.Length; $i++) {
+                    if ($cleanupObserved[$i] -ne $ownedBytes[$i]) {
+                        throw "owned update marker payload changed during cleanup"
+                    }
+                }
+                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction Stop
+                $cleanupStream.Dispose()
+                $cleanupStream = $null
+                Write-HandoffLog "removed update marker (verified owned handle)"
             }
         }
-    } catch {}
+    } catch {
+        Write-HandoffLog "could not remove owned update marker safely: $($_.Exception.Message)"
+    } finally {
+        if ($cleanupStream) { try { $cleanupStream.Dispose() } catch {} }
+        if ($ownedStream) { try { $ownedStream.Dispose() } catch {} }
+    }
 }
 
 function Start-DesktopRelaunch {
@@ -1016,18 +1067,13 @@ try {
         }
         $script:LeaseToken = if ($env:HERMES_UPDATE_LEASE_TOKEN) { $env:HERMES_UPDATE_LEASE_TOKEN } else { [Guid]::NewGuid().ToString("N") }
         $script:LeasePayload = "$PID`n$startedAt`n$($script:LeaseToken)`n"
-        $fileOptions = if ($NoMarkerCleanup) {
-            [System.IO.FileOptions]::None
-        } else {
-            [System.IO.FileOptions]::DeleteOnClose
-        }
         $script:LeaseStream = [System.IO.FileStream]::new(
             $MarkerPath,
             [System.IO.FileMode]::CreateNew,
             [System.IO.FileAccess]::ReadWrite,
             [System.IO.FileShare]::Read,
             4096,
-            $fileOptions
+            [System.IO.FileOptions]::None
         )
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($script:LeasePayload)
         $script:LeaseStream.Write($bytes, 0, $bytes.Length)
@@ -1062,11 +1108,11 @@ try {
     if ($SelfTestMarker) {
         if ($SelfTestHandoffPython) {
             # Exercise the production handle, not a fixture: while this
-            # FileStream still owns a DeleteOnClose + FileShare.Read claim,
-            # the exact child PID/token handoff must remain readable and
-            # adoptable by Python's UpdateLock. This is load-bearing on
-            # native Windows, where delete-pending/share semantics differ
-            # from POSIX and cannot be simulated faithfully elsewhere.
+            # FileStream still owns a FileShare.Read claim, so the exact child
+            # PID/token handoff must remain readable and adoptable by Python's
+            # UpdateLock. This is load-bearing on native Windows, where a
+            # DeleteOnClose handle marks the path delete-pending and makes the
+            # child read fail even though read sharing was requested.
             $probeRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
             $env:HERMES_MARKER_TEST_REPO_ROOT = $probeRoot
             $env:HERMES_MARKER_TEST_PATH = $MarkerPath
