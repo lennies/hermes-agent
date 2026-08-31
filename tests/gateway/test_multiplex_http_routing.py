@@ -57,12 +57,11 @@ class TestWebhookProfileResolution:
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex, profile_allowlist=None: [
+            lambda multiplex, profile_allowlist=None, *, generic_dispatch_only=False: [
                 (name, f"/profiles/{name}") for name in served
             ],
         )
 
         assert adapter._resolve_request_profile(Req("worker")) == "worker"
         assert adapter._resolve_request_profile(Req("restricted")) is rejected
-
 

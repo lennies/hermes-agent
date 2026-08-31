@@ -18,7 +18,9 @@ jobs:
     # capacity. Larger-runner labels are organization-scoped and remain
     # indefinitely queued in a personal fork.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The complete 33k-test suite needs more than the larger-runner budget on
+    # standard four-core capacity, without reducing coverage or oversubscribing.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

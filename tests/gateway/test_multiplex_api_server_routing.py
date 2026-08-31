@@ -46,7 +46,7 @@ class TestApiServerProfileResolution:
         adapter = _make_adapter(multiplex=True, allowlist=["worker"])
         monkeypatch.setattr(
             "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex, profile_allowlist=None: [
+            lambda multiplex, profile_allowlist=None, *, generic_dispatch_only=False: [
                 ("default", "/profiles/default"),
                 ("worker", "/profiles/worker"),
             ],

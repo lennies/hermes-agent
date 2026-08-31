@@ -747,16 +747,17 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
     return to_remove
 
 
-# Resolution memo keyed on (toolset name, include_registry, registry
-# generation). resolve_toolset() recursively walks toolset includes and, with
-# include_registry=True, merges registry-registered tools on every call —
+# Resolution memo keyed on (toolset name, include_registry, registry identity,
+# generation, and project scope). resolve_toolset() recursively walks toolset
+# includes and, with include_registry=True, merges registry-registered tools on every call —
 # measured ~2us/toolset in isolation but called dozens of times per
 # _get_platform_tools() (per-keystroke /tools completion) and per picker
 # render. The registry exposes a monotonic _generation counter (bumped on
 # every register/deregister/alias/MCP refresh — see tools/registry.py), so a
-# cache entry is valid for as long as the generation is unchanged; external
-# callers never pass ``visited``, so the memo engages exactly at the public
-# entry and the internal cycle-detection recursion stays untouched.
+# cache entry is valid for as long as the generation and project scope are
+# unchanged; external callers never pass ``visited``, so the memo engages
+# exactly at the public entry and the internal cycle-detection recursion stays
+# untouched.
 _resolve_toolset_memo: Dict[Tuple[str, bool, int, int, str], List[str]] = {}
 
 
