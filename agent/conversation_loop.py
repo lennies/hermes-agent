@@ -938,6 +938,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 )
                 stored_prompt = None
                 stored_state = "legacy_unframed"
+        else:
+            # A resumed session owns the exact policy snapshot persisted in its
+            # framed prompt.  Seed the agent before any runtime/capability
+            # rebuild below; otherwise _build_system_prompt() falls back to the
+            # policy currently on disk and silently changes authority mid-turn.
+            agent._trusted_policy_snapshot_state = _stored_policy
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Bot Chat capability epoch: an eternal bot session must adopt

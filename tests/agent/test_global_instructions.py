@@ -651,6 +651,14 @@ class TestPromptAssembly:
         assert restored._cached_system_prompt == first_prompt
         restored._build_system_prompt.assert_not_called()
 
+        restored._emit_status = lambda _message: None
+        restored._cached_system_prompt = None
+        rebuilt = build_system_prompt(restored)
+        rebuilt_state = inspect_trusted_policy_snapshot(rebuilt)
+        assert rebuilt_state.kind is TrustedPolicySnapshotKind.CONFIGURED
+        assert "POLICY_V1" in render_trusted_policy_snapshot_block(rebuilt_state)
+        assert "POLICY_V2" not in rebuilt
+
     def test_configured_policy_upgrades_unframed_legacy_session_once(
         self, hermes_root, tmp_path
     ):
@@ -676,6 +684,41 @@ class TestPromptAssembly:
         )
         restored._build_system_prompt.assert_called_once_with(None)
         db.update_system_prompt.assert_called_once_with(restored.session_id, framed)
+
+    def test_restored_absence_blocks_a_late_disk_policy_on_rebuild(
+        self, hermes_root, tmp_path
+    ):
+        first_prompt = build_system_prompt(
+            _agent(_emit_status=lambda _message: None)
+        )
+        assert (
+            inspect_trusted_policy_snapshot(first_prompt).kind
+            is TrustedPolicySnapshotKind.ABSENT
+        )
+
+        policy = tmp_path / "policy.md"
+        policy.write_text("LATE_POLICY", encoding="utf-8")
+        _configure(hermes_root, str(policy))
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": first_prompt}
+        restored = _agent(
+            _session_db=db,
+            _emit_status=lambda _message: None,
+        )
+        restored._cached_system_prompt = None
+        restored._use_prompt_caching = False
+
+        _restore_or_build_system_prompt(
+            restored, None, [{"role": "user", "content": "continue"}]
+        )
+        restored._cached_system_prompt = None
+        rebuilt = build_system_prompt(restored)
+
+        assert (
+            inspect_trusted_policy_snapshot(rebuilt).kind
+            is TrustedPolicySnapshotKind.ABSENT
+        )
+        assert "LATE_POLICY" not in rebuilt
 
 
 class TestTrustedPolicySnapshotFrame:
