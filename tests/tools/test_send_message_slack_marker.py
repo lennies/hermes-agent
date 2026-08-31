@@ -48,16 +48,22 @@ class _Session:
         *,
         lose_send_response=False,
         cancel_send_response=False,
+        cancel_send_session_exit=False,
     ):
         self.messages = list(messages or [])
         self.lose_send_response = lose_send_response
         self.cancel_send_response = cancel_send_response
+        self.cancel_send_session_exit = cancel_send_session_exit
+        self._send_committed = False
         self.calls = []
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        if self.cancel_send_session_exit and self._send_committed:
+            self.cancel_send_session_exit = False
+            raise asyncio.CancelledError()
         return False
 
     def post(self, url, *, headers, json=None, **_kwargs):
@@ -79,6 +85,7 @@ class _Session:
             "text": json["text"],
         }
         self.messages.append(row)
+        self._send_committed = True
         if self.lose_send_response:
             self.lose_send_response = False
             return _Context(error=RuntimeError("response lost"))
@@ -217,6 +224,51 @@ def test_cancelled_send_reads_back_before_releasing_claim(monkeypatch, tmp_path)
         raise AssertionError("provider cancellation was not preserved")
 
     asyncio.run(_cancelled_send())
+
+    reads = [call for call in session.calls if call[1].endswith("conversations.replies")]
+    sends = [call for call in session.calls if call[1].endswith("chat.postMessage")]
+    assert len(reads) == 2
+    assert len(sends) == 1
+
+    recovered = asyncio.run(
+        adapter.ensure_standalone_thread_marker(
+            SimpleNamespace(token="configured-token"),
+            CHANNEL,
+            THREAD,
+            MARKER,
+            message,
+            WORKSPACE,
+            ACTOR,
+        )
+    )
+    assert recovered["found"] is True
+    assert recovered["message_id"] == "1710000001.123456"
+    sends = [call for call in session.calls if call[1].endswith("chat.postMessage")]
+    assert len(sends) == 1
+
+
+def test_cancelled_send_session_exit_reads_back_before_release(monkeypatch, tmp_path):
+    message = MARKER + "\nProduction verified."
+    session = _Session(cancel_send_session_exit=True)
+    _install(monkeypatch, session)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    async def _cancelled_exit():
+        try:
+            await adapter.ensure_standalone_thread_marker(
+                SimpleNamespace(token="configured-token"),
+                CHANNEL,
+                THREAD,
+                MARKER,
+                message,
+                WORKSPACE,
+                ACTOR,
+            )
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("session teardown cancellation was not preserved")
+
+    asyncio.run(_cancelled_exit())
 
     reads = [call for call in session.calls if call[1].endswith("conversations.replies")]
     sends = [call for call in session.calls if call[1].endswith("chat.postMessage")]
