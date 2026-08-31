@@ -6,7 +6,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, start_gateway
 from gateway.session import SessionSource
 from hermes_cli.profiles import (
     ProfileDispatchDeniedError,
@@ -53,6 +53,57 @@ async def test_multiplex_message_turn_rechecks_resolved_profile(
         )
 
     runner._run_agent_inner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_profile_message_turn_rechecks_active_profile(
+    tmp_path, monkeypatch
+):
+    _root, governed = _profile_homes(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(governed))
+    (governed / "profile.yaml").write_text(
+        "dispatch_mode: generic\n", encoding="utf-8"
+    )
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False),
+        _run_agent_inner=AsyncMock(return_value={"ok": True}),
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat",
+        chat_type="dm",
+    )
+
+    assert await GatewayRunner._run_agent(
+        runner, "first", "context", [], source, "session"
+    ) == {"ok": True}
+
+    (governed / "profile.yaml").write_text(
+        "dispatch_mode: controller-only\n", encoding="utf-8"
+    )
+    with pytest.raises(ProfileDispatchDeniedError, match="authenticated controller"):
+        await GatewayRunner._run_agent(
+            runner, "second", "context", [], source, "session"
+        )
+
+    runner._run_agent_inner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_raw_gateway_start_rejects_controller_only_active_profile(
+    tmp_path, monkeypatch
+):
+    _root, governed = _profile_homes(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(governed))
+    (governed / "profile.yaml").write_text(
+        "dispatch_mode: controller-only\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+    with pytest.raises(ProfileDispatchDeniedError, match="authenticated controller"):
+        await start_gateway()
+
+    assert "HERMES_EXEC_ASK" not in __import__("os").environ
 
 
 def test_api_agent_creation_rechecks_active_profile(tmp_path, monkeypatch):

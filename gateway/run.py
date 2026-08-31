@@ -28322,6 +28322,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         change for single-profile gateways.
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                require_unclaimed_profile_turn,
+            )
+
+            require_unclaimed_profile_turn(
+                os.environ.get("HERMES_PROFILE")
+                or get_active_profile_name()
+                or "default"
+            )
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
@@ -30874,6 +30884,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Raw gateway entrypoints bypass cli.py's ordinary chat fence.  Refuse a
+    # controller-only active profile before startup creates locks, writes
+    # lifecycle state, loads tools, or connects a messaging provider.
+    from hermes_cli.profiles import (
+        get_active_profile_name,
+        require_unclaimed_profile_turn,
+    )
+
+    require_unclaimed_profile_turn(
+        os.environ.get("HERMES_PROFILE")
+        or get_active_profile_name()
+        or "default"
+    )
+
     # Enable interactive exec approval for dangerous commands on messaging
     # platforms. Set here (not at module import) so incidental imports of
     # gateway.run from CLI/tool code do not poison HERMES_EXEC_ASK.
