@@ -21113,15 +21113,10 @@ def main(
     if not gateway and not list_tools and not list_toolsets:
         if not _controller_claimed_turn.get():
             from hermes_cli.profiles import (
-                get_active_profile_name,
-                require_unclaimed_profile_turn,
+                require_unclaimed_active_profile_turn,
             )
 
-            require_unclaimed_profile_turn(
-                os.environ.get("HERMES_PROFILE")
-                or get_active_profile_name()
-                or "default"
-            )
+            require_unclaimed_active_profile_turn()
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would

@@ -170,6 +170,78 @@ def test_controller_dispatch_refuses_assignee_drift(controller_board):
     assert task is not None and task.status == "ready"
 
 
+def test_controller_dispatch_claim_cas_refuses_concurrent_reassignment(
+    controller_board,
+):
+    stages: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="target", assignee="delivery-maintainer"
+        )
+
+        def authorize(stage, _task):
+            stages.append(stage)
+            if stage == "pre-claim":
+                with kb.connect() as concurrent:
+                    assert kb.assign_task(concurrent, task_id, "other")
+            return True
+
+        result = kb.dispatch_controller_task(
+            conn,
+            task_id=task_id,
+            expected_assignee="delivery-maintainer",
+            authorize_dispatch=authorize,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert stages == ["pre-claim"]
+    assert result.spawned == []
+    assert result.skipped_unauthorized == [task_id]
+    assert task is not None and task.status == "ready"
+    assert task.assignee == "other"
+    assert task.current_run_id is None
+    assert task.claim_lock is None
+
+
+def test_controller_dispatch_rechecks_profile_mode_before_spawn(controller_board):
+    stages: list[str] = []
+
+    def authorize(stage, _task):
+        stages.append(stage)
+        if stage == "pre-spawn":
+            set_profile_dispatch_mode("delivery-maintainer", "disabled")
+        return True
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="target", assignee="delivery-maintainer"
+        )
+        result = kb.dispatch_controller_task(
+            conn,
+            task_id=task_id,
+            expected_assignee="delivery-maintainer",
+            authorize_dispatch=authorize,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+        )
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+    assert stages == ["pre-claim", "pre-spawn"]
+    assert result.spawned == []
+    assert result.skipped_unauthorized == [task_id]
+    assert task is not None and task.status == "ready"
+    assert task.current_run_id is None
+    assert task.claim_lock is None
+    assert run is not None
+    assert run["status"] == "dispatch_authorization_revoked"
+    assert run["outcome"] == "dispatch_authorization_revoked"
+
+
 def test_controller_checkpoint_releases_exact_claim_to_same_stable_task(
     controller_board,
 ):

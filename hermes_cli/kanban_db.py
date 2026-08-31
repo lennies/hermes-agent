@@ -4623,6 +4623,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4688,8 +4689,16 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND (? IS NULL OR assignee = ?)
             """,
-            (lock, expires, now, task_id),
+            (
+                lock,
+                expires,
+                now,
+                task_id,
+                expected_assignee,
+                expected_assignee,
+            ),
         )
         if cur.rowcount != 1:
             return None
@@ -4826,6 +4835,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4869,8 +4879,16 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND (? IS NULL OR assignee = ?)
             """,
-            (lock, expires, now, task_id),
+            (
+                lock,
+                expires,
+                now,
+                task_id,
+                expected_assignee,
+                expected_assignee,
+            ),
         )
         if cur.rowcount != 1:
             return None
@@ -10330,6 +10348,7 @@ def dispatch_controller_task(
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=False,
                     exact_task_id=task_id,
+                    expected_assignee=expected_assignee,
                     dispatch_authority="controller",
                     authorize_dispatch=authorize_dispatch,
                     run_maintenance=False,
@@ -10347,6 +10366,33 @@ def _profile_allows_dispatch(callback, name: str, authority: str) -> bool:
     return bool(callback(name, authority=authority))
 
 
+def _controller_claim_still_authorized(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    expected_assignee: Optional[str],
+) -> bool:
+    """Re-read exact task/profile authority at the final spawn boundary."""
+    if expected_assignee is None:
+        return True
+    current = get_task(conn, claimed.id)
+    if (
+        current is None
+        or current.status != "running"
+        or current.assignee != expected_assignee
+        or current.claim_lock != claimed.claim_lock
+        or current.current_run_id != claimed.current_run_id
+    ):
+        return False
+    try:
+        from hermes_cli.profiles import profile_dispatch_allowed
+
+        return bool(
+            profile_dispatch_allowed(expected_assignee, authority="controller")
+        )
+    except Exception:
+        return False
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -10362,6 +10408,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     exact_task_id: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
     dispatch_authority: str = "generic",
     authorize_dispatch=None,
     run_maintenance: bool = True,
@@ -10409,9 +10456,13 @@ def _dispatch_once_locked(
     if dispatch_authority not in {"generic", "controller"}:
         raise ValueError("dispatch authority is invalid")
     if dispatch_authority == "controller" and (
-        not exact_task_id or not callable(authorize_dispatch)
+        not exact_task_id
+        or not expected_assignee
+        or not callable(authorize_dispatch)
     ):
         raise ValueError("controller dispatch requires exact task authorization")
+    if dispatch_authority != "controller" and expected_assignee is not None:
+        raise ValueError("expected assignee is reserved for controller dispatch")
     if run_maintenance:
         result.reclaimed = release_stale_claims(conn)
     if run_maintenance and reconcile_orphans:
@@ -10740,8 +10791,20 @@ def _dispatch_once_locked(
             if not authorized:
                 result.skipped_unauthorized.append(row["id"])
                 continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_assignee=expected_assignee,
+        )
         if claimed is None:
+            current = get_task(conn, row["id"])
+            if (
+                expected_assignee is not None
+                and current is not None
+                and current.assignee != expected_assignee
+            ):
+                result.skipped_unauthorized.append(row["id"])
             continue
         try:
             resolved_branch_name = None
@@ -10778,6 +10841,10 @@ def _dispatch_once_locked(
                 authorized = bool(authorize_dispatch("pre-spawn", claimed))
             except Exception:
                 authorized = False
+            if authorized:
+                authorized = _controller_claim_still_authorized(
+                    conn, claimed, expected_assignee
+                )
             if not authorized:
                 _release_claim_for_dispatch_pause(
                     conn,
@@ -10941,8 +11008,20 @@ def _dispatch_once_locked(
             if not authorized:
                 result.skipped_unauthorized.append(row["id"])
                 continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_assignee=expected_assignee,
+        )
         if claimed is None:
+            current = get_task(conn, row["id"])
+            if (
+                expected_assignee is not None
+                and current is not None
+                and current.assignee != expected_assignee
+            ):
+                result.skipped_unauthorized.append(row["id"])
             continue
         try:
             resolved_branch_name = None
@@ -10983,6 +11062,10 @@ def _dispatch_once_locked(
                 authorized = bool(authorize_dispatch("pre-spawn", claimed))
             except Exception:
                 authorized = False
+            if authorized:
+                authorized = _controller_claim_still_authorized(
+                    conn, claimed, expected_assignee
+                )
             if not authorized:
                 _release_claim_for_dispatch_pause(
                     conn,

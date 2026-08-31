@@ -28323,15 +28323,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             from hermes_cli.profiles import (
-                get_active_profile_name,
-                require_unclaimed_profile_turn,
+                require_unclaimed_active_profile_turn,
             )
 
-            require_unclaimed_profile_turn(
-                os.environ.get("HERMES_PROFILE")
-                or get_active_profile_name()
-                or "default"
-            )
+            require_unclaimed_active_profile_turn()
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
@@ -30888,15 +30883,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # controller-only active profile before startup creates locks, writes
     # lifecycle state, loads tools, or connects a messaging provider.
     from hermes_cli.profiles import (
-        get_active_profile_name,
-        require_unclaimed_profile_turn,
+        require_unclaimed_active_profile_turn,
     )
 
-    require_unclaimed_profile_turn(
-        os.environ.get("HERMES_PROFILE")
-        or get_active_profile_name()
-        or "default"
-    )
+    require_unclaimed_active_profile_turn()
 
     # Enable interactive exec approval for dangerous commands on messaging
     # platforms. Set here (not at module import) so incidental imports of

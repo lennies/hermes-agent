@@ -1118,6 +1118,31 @@ def require_unclaimed_profile_turn(
     )
 
 
+def require_unclaimed_active_profile_turn() -> str:
+    """Fence a single-profile turn using the identity derived from its home.
+
+    ``HERMES_PROFILE`` labels worker attribution and can outlive a profile-home
+    change. It is never runtime authority. A conflicting label is rejected
+    rather than allowed to make a controller-only ``HERMES_HOME`` look generic.
+    Multiplex gateways use their request-scoped home directly and therefore do
+    not call this single-profile helper.
+    """
+    active = get_active_profile_name() or "default"
+    ambient = os.environ.get("HERMES_PROFILE")
+    if ambient:
+        try:
+            labelled = normalize_profile_name(ambient)
+        except ValueError as exc:
+            raise ProfileDispatchDeniedError(
+                "Hermes profile identity does not match the active profile home."
+            ) from exc
+        if labelled != active:
+            raise ProfileDispatchDeniedError(
+                "Hermes profile identity does not match the active profile home."
+            )
+    return require_unclaimed_profile_turn(active)
+
+
 # ---------------------------------------------------------------------------
 # CRUD operations
 # ---------------------------------------------------------------------------

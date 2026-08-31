@@ -185,6 +185,7 @@ class TestProfileDispatchMode:
         create_profile("worker", no_alias=True)
         set_profile_dispatch_mode("worker", "controller-only")
         monkeypatch.setenv("HERMES_PROFILE", "worker")
+        monkeypatch.setenv("HERMES_HOME", str(get_profile_dir("worker")))
 
         with pytest.raises(PermissionError, match="authenticated controller"):
             raw_cli.main(query="must not start", quiet=True)
