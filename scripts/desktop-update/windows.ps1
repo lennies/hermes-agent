@@ -1134,7 +1134,13 @@ after = path.read_bytes()
 if after != before:
     raise SystemExit("child adoption changed the parent-owned lease")
 '@
-            & $SelfTestHandoffPython "-c" $probe
+            # Windows PowerShell 5.1 rebuilds native command lines and strips
+            # the quotes inside a multiline `-c` argument. Carry the probe as
+            # base64 data and keep the bootstrap quote-free so both 5.1 and
+            # pwsh 7 execute the identical source bytes.
+            $encodedProbe = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($probe))
+            $probeBootstrap = "import base64,sys;exec(base64.b64decode(sys.argv[1]))"
+            & $SelfTestHandoffPython "-c" $probeBootstrap $encodedProbe
             if ($LASTEXITCODE -ne 0) {
                 throw "child Python UpdateLock could not adopt the production lease"
             }
