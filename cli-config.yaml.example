@@ -4,6 +4,14 @@
 # This file configures CLI behavior; only documented secret environment
 # variables in .env take precedence over their corresponding settings.
 
+# Optional host-wide instructions injected into every agent prompt. Leave empty
+# to disable. Set this only in the default Hermes root config (normally
+# ~/.hermes/config.yaml), never in a named profile. The path must be absolute or
+# start with ~/. This setting is a literal-path exception: ${VAR} and
+# ${env:VAR} are not expanded. A configured file must be a non-empty, regular UTF-8 file no
+# larger than 500,000 bytes; prompt construction fails if it cannot be loaded.
+global_instructions_file: ""
+
 # =============================================================================
 # Database Configuration
 # =============================================================================

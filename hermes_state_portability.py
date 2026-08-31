@@ -27,6 +27,13 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")
 
 
+# Persisted system prompts are trusted runtime state, not conversation data.
+# They can contain host policy text plus its source path and integrity frame,
+# so portable/user-facing exports must omit both the hydrated prompt and its
+# content-addressed storage key.  Imports already rebuild prompts locally.
+_PORTABLE_SESSION_EXCLUDED = frozenset({"system_prompt", "system_prompt_hash"})
+
+
 class SessionPortabilityMixin:
     """See module docstring — mixin for SessionDB (Port cluster)."""
 
@@ -266,13 +273,22 @@ class SessionPortabilityMixin:
         decoded = self._decode_content(row["content"])
         return decoded if isinstance(decoded, str) else ""
 
+    @staticmethod
+    def portable_session_metadata(session: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy session metadata across the trusted-state export boundary."""
+        return {
+            key: value
+            for key, value in session.items()
+            if key not in _PORTABLE_SESSION_EXCLUDED
+        }
+
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Export a single session with all its messages as a dict."""
+        """Export portable conversation data without trusted prompt state."""
         session = self.get_session(session_id)
         if not session:
             return None
         messages = self.get_messages(session_id)
-        return {**session, "messages": messages}
+        return {**self.portable_session_metadata(session), "messages": messages}
 
     def export_session_lineage(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Export a compression lineage as one logical session dict."""
@@ -303,7 +319,9 @@ class SessionPortabilityMixin:
         results = []
         for session in sessions:
             messages = self.get_messages(session["id"])
-            results.append({**session, "messages": messages})
+            results.append(
+                {**self.portable_session_metadata(session), "messages": messages}
+            )
         return results
 
     def adopt_session_lineage_from(
@@ -539,7 +557,6 @@ class SessionPortabilityMixin:
             "source",
             "user_id",
             "model",
-            "system_prompt",
             "end_reason",
             "cwd",
             "git_branch",
@@ -622,9 +639,13 @@ class SessionPortabilityMixin:
             try:
                 clean_session = dict(raw)
                 clean_session["id"] = session_id
-                clean_session["model_config"] = self._import_json_object_or_none(
-                    clean_session.get("model_config"), "model_config"
-                )
+                # A portable archive restores conversation history, not live
+                # execution authority or provider routing. model_config can
+                # carry yolo_mode plus gateway_runtime provider/base_url and
+                # api_mode; importing it could auto-approve commands or send
+                # the resumed host policy/credentials to an archive-selected
+                # endpoint. Rebuild all runtime state from this host.
+                clean_session["model_config"] = None
                 clean_session["parent_session_id"] = self._import_text_or_none(
                     clean_session.get("parent_session_id"), "parent_session_id"
                 )
@@ -632,6 +653,12 @@ class SessionPortabilityMixin:
                     clean_session[field] = self._import_text_or_none(
                         clean_session.get(field), field
                     )
+                # A portable archive is conversation data, not a trusted
+                # executable prompt snapshot.  Always rebuild the system
+                # prompt from this host on first resume; otherwise an imported
+                # self-consistent provenance frame could be promoted into a
+                # trusted Codex developer message.
+                clean_session["system_prompt"] = None
 
                 clean_messages: List[Dict[str, Any]] = []
                 for message_index, message in enumerate(messages):
@@ -639,6 +666,11 @@ class SessionPortabilityMixin:
                     role = clean_message.get("role")
                     if not isinstance(role, str) or not role:
                         raise ValueError(f"messages[{message_index}].role must be a non-empty string")
+                    if role.casefold() in {"system", "developer"}:
+                        raise ValueError(
+                            f"messages[{message_index}].role cannot be {role!r} in a "
+                            "portable archive"
+                        )
                     for field in message_text_fields:
                         if field == "role":
                             continue
@@ -699,9 +731,7 @@ class SessionPortabilityMixin:
                 if started_at is None:
                     started_at = time.time()
                 archived = 1 if raw.get("archived") else 0
-                system_prompt_hash = self._store_system_prompt(
-                    conn, raw.get("system_prompt")
-                )
+                system_prompt_hash = None
 
                 conn.execute(
                     """INSERT INTO sessions (

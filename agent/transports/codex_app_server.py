@@ -17,7 +17,6 @@ runtime is not selected.
 from __future__ import annotations
 
 import json
-import os
 import queue
 import subprocess
 import threading
@@ -30,7 +29,6 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
-
 
 @dataclass
 class CodexAppServerError(RuntimeError):
@@ -93,37 +91,9 @@ class CodexAppServerClient:
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
-        app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to
-        # the board DB, which lives outside the per-task workspace. Keep the
-        # Codex sandbox on, but add the Kanban root as the only extra writable
-        # root. Without this, codex-runtime workers finish their actual work
-        # but crash/block when kanban_complete/kanban_block writes SQLite.
-        if spawn_env.get("HERMES_KANBAN_TASK"):
-            kanban_db = spawn_env.get("HERMES_KANBAN_DB")
-            kanban_root = (
-                os.path.dirname(kanban_db)
-                if kanban_db
-                else spawn_env.get(
-                    "HERMES_KANBAN_ROOT",
-                    os.path.join(
-                        spawn_env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                        "kanban",
-                    ),
-                )
-            )
-            app_server_args.extend(
-                [
-                    "-c",
-                    'sandbox_mode="workspace-write"',
-                    "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
-                    "-c",
-                    "sandbox_workspace_write.network_access=false",
-                ]
-            )
-
-        cmd = [codex_bin, "app-server"] + app_server_args
+        # The session adapter is the sole owner of host security overrides.
+        # This wire client only forwards its already-rendered argument list.
+        cmd = [codex_bin, "app-server"] + list(extra_args or [])
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 

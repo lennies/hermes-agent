@@ -8556,6 +8556,12 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        from agent.auxiliary_client import (
+            begin_runtime_trusted_policy_scope,
+            reset_runtime_trusted_policy_block,
+        )
+
+        trusted_policy_scope_token = begin_runtime_trusted_policy_scope()
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -8968,6 +8974,7 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    reset_runtime_trusted_policy_block(trusted_policy_scope_token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

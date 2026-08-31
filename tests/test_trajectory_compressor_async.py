@@ -11,7 +11,7 @@ each asyncio.run() gets a client bound to the current loop.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -141,6 +141,33 @@ async def test_generate_summary_async_kimi_omits_temperature():
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in async_client.chat.completions.create.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_async_direct_client_receives_trusted_policy():
+    from trajectory_compressor import CompressionConfig, TrajectoryCompressor, TrajectoryMetrics
+
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = CompressionConfig(max_retries=1)
+    compressor.logger = MagicMock()
+    compressor._use_call_llm = False
+    async_client = MagicMock()
+    async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: ok"))]
+    ))
+    compressor._get_async_client = MagicMock(return_value=async_client)
+    policy_messages = [
+        {"role": "system", "content": "# Trusted Host Policy\n\nFrozen."},
+        {"role": "user", "content": "summary task"},
+    ]
+
+    with patch(
+        "agent.auxiliary_client._auxiliary_messages_with_trusted_policy",
+        return_value=policy_messages,
+    ):
+        await compressor._generate_summary_async("tool output", TrajectoryMetrics())
+
+    assert async_client.chat.completions.create.call_args.kwargs["messages"] is policy_messages
 
 
 @pytest.mark.asyncio

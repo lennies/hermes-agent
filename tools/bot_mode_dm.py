@@ -344,6 +344,13 @@ def message_agent_tool(
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
+    try:
+        from hermes_cli.profiles import require_unclaimed_profile_turn
+
+        resolved = require_unclaimed_profile_turn(resolved, root=root)
+    except Exception as exc:
+        return _err(str(exc), roster=teammates, peers=peers)
+
     return _start_delivery(
         [
             "hermes",

@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import time
+from unittest import mock
 
 import pytest
 
@@ -255,11 +256,42 @@ def test_local_delivery_command_never_reenters_the_lock():
     matcher and this assertion both go by basename."""
     from pathlib import Path
 
-    argv = bot_relay.local_delivery_command("ops", "/tmp/q.txt")
+    with mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=True):
+        argv = bot_relay.local_delivery_command("ops", "/tmp/q.txt")
     assert argv[1:3] == ["-p", "ops"]
     assert Path(argv[0]).name in ("hermes", "hermes.exe")
     assert "--run-delivery" not in argv
     assert not any("bot_mode_dm" in part for part in argv)
+
+
+def test_local_delivery_command_rejects_controller_only_profile():
+    with mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=False):
+        with pytest.raises(PermissionError, match="controller"):
+            bot_relay.local_delivery_command("delivery-reviewer", "/tmp/q.txt")
+
+
+def test_relay_deliver_rejects_controller_only_profile_before_spawn(
+    tmp_path, monkeypatch
+):
+    import tui_gateway.server as srv
+
+    h = tmp_path / "h"
+    (h / "profiles" / "delivery-reviewer").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(h))
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_dispatch_allowed",
+        lambda _name, **_kwargs: False,
+    )
+    spawned = []
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: spawned.append(args))
+
+    out = srv._methods["bot_relay.deliver"](
+        1, {"profile": "delivery-reviewer", "message": "x"}
+    )
+
+    assert out["error"]["code"] == 4093
+    assert out["error"]["data"]["reason"] == "profile_dispatch_denied"
+    assert spawned == []
 
 
 def test_relay_deliver_returns_target_busy_error(tmp_path, monkeypatch):

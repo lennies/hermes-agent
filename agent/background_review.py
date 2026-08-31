@@ -1264,6 +1264,7 @@ def _run_review_in_thread(
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                skip_context_files=getattr(agent, "skip_context_files", False),
                 skip_memory=True,
                 **_fork_kwargs,
             )

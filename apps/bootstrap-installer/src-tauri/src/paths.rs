@@ -87,7 +87,21 @@ pub fn installer_dest() -> PathBuf {
 /// Electron desktop — which resolves HERMES_HOME identically and pins it into
 /// the updater's env — agrees on the exact path.
 pub fn update_in_progress_marker() -> PathBuf {
-    hermes_home().join(".hermes-update-in-progress")
+    update_root().join(".hermes-update-in-progress")
+}
+
+/// Install-global root used by every update writer, even when the caller was
+/// launched under `<root>/profiles/<name>`.
+pub fn update_root() -> PathBuf {
+    let home = hermes_home();
+    if home.parent().and_then(Path::file_name).and_then(|name| name.to_str()) == Some("profiles") {
+        return home
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or(home);
+    }
+    home
 }
 
 /// Copy the currently-running installer binary to `installer_dest()` so it's

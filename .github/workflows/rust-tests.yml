@@ -7,12 +7,10 @@ name: Rust tests
 # cannot notice a Rust error. The crate's unit tests existed in the tree and had
 # never run.
 #
-# Linux runner on purpose. The pipe-drain tests in src/powershell.rs need a real
-# process tree whose grandchild inherits the parent's stdout, and their fixture
-# is `#[cfg(unix)]`; the Windows half of that same contract is covered by
-# `-SelfTestPipeDrain` in scripts/desktop-update/windows.ps1 on the Windows
-# lane. A Windows runner here would compile them out and report green over zero
-# coverage.
+# Linux remains the behavioral lane for the Unix pipe-drain tests in
+# src/powershell.rs. A second native Windows job compiles and tests the
+# platform-specific PID and file-identity code; the PowerShell half of the
+# handoff contract runs in installer-tests.yml.
 
 on:
   workflow_call:
@@ -27,10 +25,8 @@ concurrency:
 jobs:
   bootstrap-installer:
     name: cargo test (bootstrap installer)
-    # cargo builds codegen units and test binaries in parallel across the
-    # cores. This lane also builds the crate from the start when Cargo.toml
-    # changes.
-    runs-on: ubuntu-latest-32-core
+    # Standard capacity keeps the fork's required check dispatchable.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
@@ -72,5 +68,30 @@ jobs:
 
       # --lib only: the integration/bin targets would need a built frontend
       # (vite dist) that this lane deliberately does not produce.
+      - name: cargo test
+        run: cargo test --lib
+
+  bootstrap-installer-windows:
+    name: cargo test (bootstrap installer, Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/bootstrap-installer/src-tauri
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The update lease has platform-specific PID and file-ID code. Linux
+      # cargo tests cannot even compile the Windows branch, so keep a native
+      # Windows build/test gate on every Rust-lane change.
+      - name: Restore cargo cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/bootstrap-installer/src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml') }}
+
       - name: cargo test
         run: cargo test --lib

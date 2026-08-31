@@ -110,7 +110,7 @@ async def test_profile_middleware_binds_auth_before_handler(
     )()
     monkeypatch.setattr(
         "hermes_cli.profiles.profiles_to_serve",
-        lambda multiplex, profile_allowlist=None: [
+        lambda multiplex, profile_allowlist=None, *, generic_dispatch_only=False: [
             ("default", tmp_path), ("worker", worker_home)
         ],
     )
@@ -159,5 +159,4 @@ async def test_profile_middleware_binds_auth_before_handler(
         )
         assert accepted.status == 200
         assert (await accepted.json())["profile"] == "worker"
-
 

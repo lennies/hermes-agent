@@ -209,12 +209,8 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
-        """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace, but should not fall back to
-        danger-full-access. Hermes passes a narrow app-server config override
-        for the Kanban root only.
-        """
+    def test_wire_client_does_not_synthesize_kanban_security_overrides(self, monkeypatch):
+        """Only the session boundary renderer may emit security overrides."""
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -255,14 +251,118 @@ class TestSpawnEnvIsolation:
         client._closed = True
 
         cmd = captured["cmd"]
-        assert cmd[:2] == ["codex", "app-server"]
-        assert 'sandbox_mode="workspace-write"' in cmd
-        assert (
-            'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
-            in cmd
+        assert cmd == ["codex", "app-server"]
+
+    @pytest.mark.parametrize(
+        ("permission_profile", "kanban", "expected_mode", "expected_roots"),
+        [
+            (
+                "read-only-with-approval",
+                True,
+                'sandbox_mode="read-only"',
+                "sandbox_workspace_write.writable_roots=[]",
+            ),
+            (
+                "workspace-write",
+                False,
+                'sandbox_mode="workspace-write"',
+                "sandbox_workspace_write.writable_roots=[]",
+            ),
+            (
+                "workspace-write",
+                True,
+                'sandbox_mode="workspace-write"',
+                'sandbox_workspace_write.writable_roots=['
+                '"/users/alice/.hermes/kanban/boards/worker"]',
+            ),
+        ],
+        ids=["read-only-kanban", "ordinary-workspace", "kanban-workspace"],
+    )
+    def test_final_host_owned_sandbox_roots_follow_session_profile(
+        self,
+        monkeypatch,
+        permission_profile,
+        kanban,
+        expected_mode,
+        expected_roots,
+    ):
+        """Each host-owned security key is rendered exactly once."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+        from agent.transports.codex_app_server_session import (
+            _ServerRequestRouting,
+            _host_owned_codex_overrides,
         )
-        assert "sandbox_workspace_write.network_access=false" in cmd
-        assert all("danger" not in part for part in cmd)
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        if kanban:
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+            monkeypatch.setenv(
+                "HERMES_KANBAN_DB",
+                "/users/alice/.hermes/kanban/boards/worker/kanban.db",
+            )
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+            monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        host_overrides = _host_owned_codex_overrides(
+            permission_profile,
+            _ServerRequestRouting(),
+            "/tmp/worker",
+        )
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            extra_args=host_overrides,
+        )
+        client._closed = True
+
+        cmd = captured["cmd"]
+        config_values = [cmd[i + 1] for i, arg in enumerate(cmd[:-1]) if arg == "-c"]
+        assert [v for v in config_values if v.startswith("sandbox_mode=")] == [
+            expected_mode
+        ]
+        assert [
+            v
+            for v in config_values
+            if v.startswith("sandbox_workspace_write.writable_roots=")
+        ] == [expected_roots]
+        assert [
+            v
+            for v in config_values
+            if v.startswith("sandbox_workspace_write.network_access=")
+        ] == ["sandbox_workspace_write.network_access=false"]
+        assert [v for v in config_values if v.startswith("approval_policy=")] == [
+            'approval_policy="on-request"'
+        ]
+        assert [
+            v
+            for v in config_values
+            if v.startswith("shell_environment_policy.inherit=")
+        ] == ['shell_environment_policy.inherit="core"']
+        assert cmd[-len(host_overrides):] == host_overrides
 
 
 class TestSpawnEnvSecretStripping:
@@ -339,4 +439,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

@@ -560,6 +560,9 @@ def _hermes_cli() -> str:
 
 def local_delivery_command(profile: str, query_file: str) -> list[str]:
     """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
+    from hermes_cli.profiles import require_unclaimed_profile_turn
+
+    profile = require_unclaimed_profile_turn(profile)
     return [
         _hermes_cli(),
         "-p",

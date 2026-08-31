@@ -88,6 +88,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import urlsplit
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -132,7 +133,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
-VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_WORKSPACE_KINDS = {"scratch", "worktree", "isolated_clone", "dir"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -3242,8 +3243,10 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
+    if branch_name and workspace_kind not in {"worktree", "isolated_clone"}:
+        raise ValueError(
+            "branch_name is only valid for worktree or isolated_clone workspaces"
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -4620,6 +4623,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4685,8 +4689,16 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND (? IS NULL OR assignee = ?)
             """,
-            (lock, expires, now, task_id),
+            (
+                lock,
+                expires,
+                now,
+                task_id,
+                expected_assignee,
+                expected_assignee,
+            ),
         )
         if cur.rowcount != 1:
             return None
@@ -4736,12 +4748,94 @@ def claim_task(
     return claimed
 
 
+def release_controller_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_claim_lock: str,
+    checkpoint_digest: str,
+) -> bool:
+    """Close one deterministic controller tick and return its task to ready.
+
+    Repository delivery uses one stable ``delivery-controller`` task per
+    generation while each deterministic orchestration tick receives a fresh
+    Hermes run and claim.  This narrow CAS release makes that lifecycle
+    explicit: it only accepts the controller assignee, the exact current run
+    and claim, no spawned worker PID, and a SHA-256 checkpoint digest.  A
+    mismatch leaves the task untouched.
+
+    The function intentionally does not complete the task.  Completion is a
+    separate lifecycle decision after production verification and issue
+    closure; releasing a tick merely allows the next deterministic transition
+    to claim the same stable controller task.
+    """
+
+    task_id = str(task_id or "").strip()
+    expected_claim_lock = str(expected_claim_lock or "").strip()
+    checkpoint_digest = str(checkpoint_digest or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    if type(expected_run_id) is not int or expected_run_id <= 0:
+        raise ValueError("expected_run_id must be a positive integer")
+    if not expected_claim_lock:
+        raise ValueError("expected_claim_lock is required")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", checkpoint_digest):
+        raise ValueError("checkpoint_digest must be a sha256 digest")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee, status, current_run_id, claim_lock, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["assignee"] != "delivery-controller"
+            or row["status"] != "running"
+            or row["current_run_id"] != expected_run_id
+            or row["claim_lock"] != expected_claim_lock
+            or row["worker_pid"] is not None
+        ):
+            return False
+
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND assignee = 'delivery-controller' "
+            "AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock = ? AND worker_pid IS NULL",
+            (task_id, expected_run_id, expected_claim_lock),
+        )
+        if updated.rowcount != 1:
+            return False
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="controller_checkpoint",
+            status="controller_checkpoint",
+            summary=checkpoint_digest,
+            metadata={"checkpoint_digest": checkpoint_digest},
+        )
+        if closed_run_id != expected_run_id:
+            raise RuntimeError("controller run pointer changed during release")
+        _append_event(
+            conn,
+            task_id,
+            "controller_checkpoint",
+            {"checkpoint_digest": checkpoint_digest},
+            run_id=closed_run_id,
+        )
+        return True
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4785,8 +4879,16 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND (? IS NULL OR assignee = ?)
             """,
-            (lock, expires, now, task_id),
+            (
+                lock,
+                expires,
+                now,
+                task_id,
+                expected_assignee,
+                expected_assignee,
+            ),
         )
         if cur.rowcount != 1:
             return None
@@ -7829,6 +7931,178 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _git_remote_origin(path: Path) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _credential_free_remote_origin(value: str) -> bool:
+    """Reject HTTP(S) remotes whose URL persists embedded user information."""
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return True
+    return parsed.username is None and parsed.password is None
+
+
+def _is_self_contained_checkout(path: Path, branch_name: str) -> bool:
+    """Return whether ``path`` is an exact, non-linked checkout of a branch."""
+    if not path.is_dir() or not (path / ".git").is_dir():
+        return False
+    top = _git_toplevel(path)
+    git_dir = _git_dir(path)
+    common_dir = _git_common_dir(path)
+    return (
+        top == path.resolve(strict=False)
+        and git_dir == (path / ".git").resolve(strict=False)
+        and common_dir == git_dir
+        and _git_current_branch(path) == branch_name
+    )
+
+
+def _resolve_isolated_clone_workspace(
+    task: Task, *, board: Optional[str] = None
+) -> tuple[Path, str]:
+    """Materialize a task-owned clone whose git metadata stays in-sandbox.
+
+    Linked worktrees keep ``.git`` metadata in the parent checkout, outside a
+    workspace-only Seatbelt policy. Repository-delivery workers therefore use
+    this kind: Hermes clones committed source state into the board-owned
+    workspace root, preserves the canonical ``origin`` URL, and refuses to
+    reuse a checkout unless both its branch and internal git boundary match.
+    """
+    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    target = (workspaces_root(board=board) / task.id).resolve(strict=False)
+
+    if target.exists():
+        if _is_self_contained_checkout(target, branch_name):
+            return target, branch_name
+        raise ValueError(
+            f"task {task.id} isolated-clone target already exists but does not "
+            "match its exact branch and self-contained git boundary"
+        )
+
+    source_value = (task.workspace_path or "").strip()
+    if not source_value:
+        board_slug = board if board else get_current_board()
+        source_value = (
+            read_board_metadata(board_slug).get("default_workdir") or ""
+        ).strip()
+        if not source_value:
+            raise ValueError(
+                f"task {task.id} has workspace_kind=isolated_clone but no "
+                f"workspace_path, and board {board_slug!r} has no "
+                "default_workdir set"
+            )
+
+    source = Path(source_value).expanduser()
+    if not source.is_absolute():
+        raise ValueError(
+            f"task {task.id} has non-absolute isolated-clone source "
+            f"{source_value!r}; use an absolute git checkout path"
+        )
+    source = source.resolve(strict=False)
+    if _git_toplevel(source) != source:
+        raise ValueError(
+            f"task {task.id} isolated-clone source is not a git repository root"
+        )
+    origin = _git_remote_origin(source)
+    if origin is None:
+        raise ValueError(
+            f"task {task.id} isolated-clone source has no canonical origin remote"
+        )
+    if not _credential_free_remote_origin(origin):
+        raise ValueError(
+            f"task {task.id} isolated-clone origin contains embedded credentials"
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.parent / f".{task.id}.staging-{secrets.token_hex(8)}"
+    try:
+        clone = subprocess.run(
+            [
+                "git", "clone", "--no-local", "--no-checkout",
+                "--origin", "origin", str(source), str(staging),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            check=False,
+        )
+        if clone.returncode != 0:
+            raise RuntimeError(
+                f"task {task.id} isolated-clone materialization failed"
+            )
+        remote = subprocess.run(
+            ["git", "-C", str(staging), "remote", "set-url", "origin", origin],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if remote.returncode != 0:
+            raise RuntimeError(
+                f"task {task.id} isolated-clone origin binding failed"
+            )
+        if _git_branch_exists(staging, branch_name):
+            checkout_cmd = ["git", "-C", str(staging), "checkout", branch_name]
+        else:
+            checkout_cmd = [
+                "git", "-C", str(staging), "checkout", "-b", branch_name,
+                "HEAD",
+            ]
+        checkout = subprocess.run(
+            checkout_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if checkout.returncode != 0 or not _is_self_contained_checkout(
+            staging, branch_name
+        ):
+            raise RuntimeError(
+                f"task {task.id} isolated-clone branch materialization failed"
+            )
+        os.replace(staging, target)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    if not _is_self_contained_checkout(target, branch_name):
+        raise RuntimeError(
+            f"task {task.id} isolated-clone verification failed"
+        )
+    if _git_remote_origin(target) != origin:
+        raise RuntimeError(
+            f"task {task.id} isolated-clone origin verification failed"
+        )
+    return target, branch_name
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -7851,6 +8125,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       ``default_workdir`` is configured it raises rather than guessing from the
       dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
       ``wt/<task-id>``.
+    - ``isolated_clone``: a board-owned, self-contained git checkout at
+      ``<board-root>/workspaces/<task-id>``. Its ``.git`` directory is local to
+      the task workspace (never linked to a parent checkout), its origin is
+      preserved from the source repo, and branch drift fails closed. This is
+      the confinement-safe workspace used by repository-delivery workers.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -7887,6 +8166,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        return p
+    if kind == "isolated_clone":
+        p, _branch_name = _resolve_isolated_clone_workspace(task, board=board)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -8041,6 +8323,10 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_unauthorized: list[str] = field(default_factory=list)
+    """Exact task ids refused by the controller-dispatch authorization
+    callback. Generic dispatch never populates this bucket. A refusal is
+    fail-closed and happens before claim/spawn mutation."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9539,7 +9825,7 @@ def check_respawn_guard(
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a generically dispatchable Hermes profile.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
@@ -9547,9 +9833,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    Fails closed when the profile dispatch policy is unavailable: a partial
+    install must never turn controller-only work into generic work.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
@@ -9559,19 +9844,18 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     if not rows:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        from hermes_cli.profiles import profile_dispatch_allowed
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        return False
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_dispatch_allowed(row["assignee"]):
             return True
     return False
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a generically dispatchable Hermes profile.
 
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
@@ -9585,11 +9869,11 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     if not rows:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        from hermes_cli.profiles import profile_dispatch_allowed
     except Exception:
-        return True
+        return False
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_dispatch_allowed(row["assignee"]):
             return True
     return False
 
@@ -9805,6 +10089,106 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def new_work_dispatch_allowed() -> bool:
+    """Return False while the install-global ESTOP is engaged.
+
+    This is the shared final fence for every dispatcher entry point: gateway,
+    direct CLI, and the standalone daemon. Import/read failures fail closed;
+    inability to prove that new work is allowed is never authority to spawn.
+    """
+    try:
+        from agent.estop import check_paused
+
+        return not check_paused("kanban", _log)
+    except Exception:
+        _log.exception(
+            "kanban dispatch: emergency-stop state is unavailable; "
+            "spawning no new workers"
+        )
+        return False
+
+
+class _DispatchPausedDuringSpawn(RuntimeError):
+    """The global ESTOP closed while a worker was at the spawn boundary."""
+
+    def __init__(
+        self,
+        *,
+        pid: Optional[int] = None,
+        terminated: bool = True,
+    ) -> None:
+        super().__init__("new-work dispatch paused at worker spawn boundary")
+        self.pid = int(pid) if pid else None
+        self.terminated = bool(terminated)
+
+
+def _release_claim_for_dispatch_pause(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    outcome: str = "dispatch_paused",
+    summary: str = "global ESTOP closed before worker startup",
+) -> bool:
+    """Restore an unspawned claim to its source lane without a failure tick."""
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["claim_lock"] != task.claim_lock
+        ):
+            return False
+        run_id = row["current_run_id"]
+        retry_status = _retry_status_for_run(conn, task.id, run_id)
+        updated = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (retry_status, task.id, task.claim_lock),
+        )
+        if updated.rowcount != 1:
+            return False
+        closed_run_id = _end_run(
+            conn,
+            task.id,
+            outcome=outcome,
+            status=outcome,
+            summary=summary,
+            metadata={"retry_status": retry_status},
+        )
+        _append_event(
+            conn,
+            task.id,
+            outcome,
+            {"retry_status": retry_status},
+            run_id=closed_run_id,
+        )
+        return True
+
+
+def _record_spawn_admitted_across_dispatch_pause(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: Optional[int],
+) -> None:
+    """Retain ownership for work that became in-flight at the ESTOP edge."""
+
+    if pid:
+        _set_worker_pid(conn, task.id, int(pid))
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task.id,
+            "dispatch_pause_race_admitted",
+            {"pid": int(pid) if pid else None},
+            run_id=_current_run_id(conn, task.id),
+        )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9887,6 +10271,128 @@ def dispatch_once(
     return result
 
 
+def dispatch_controller_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    expected_assignee: str,
+    authorize_dispatch,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    board: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> DispatchResult:
+    """Dispatch one exact controller-only task through Hermes' native lease.
+
+    This is the narrow positive route paired with
+    ``profiles.profile_dispatch_allowed(..., authority="controller")``.
+    It deliberately has no CLI surface: an activated deterministic controller
+    must supply a callback that revalidates its external task/run claim before
+    claim and again immediately before spawn. The generic gateway dispatcher
+    remains unable to select controller-only profiles.
+
+    The exact-task pass shares Hermes' board-scoped dispatcher lock, ESTOP,
+    host/board concurrency limits, per-profile cap, claim/run rows, workspace
+    resolution, PID persistence, failure accounting, and spawn observers. It
+    does not perform board-wide reclaim/promotion maintenance; that remains the
+    single gateway scheduler's responsibility.
+    """
+
+    task_id = str(task_id or "").strip()
+    expected_assignee = _canonical_assignee(expected_assignee)
+    if not task_id:
+        raise ValueError("task_id is required")
+    if not expected_assignee:
+        raise ValueError("expected_assignee is required")
+    if not callable(authorize_dispatch):
+        raise ValueError("authorize_dispatch callback is required")
+    if not callable(spawn_fn):
+        raise ValueError(
+            "controller dispatch requires an explicit confined spawn callback"
+        )
+
+    try:
+        db_path = kanban_db_path(board=board)
+    except Exception:
+        # Unlike generic best-effort dispatch, controller dispatch is a
+        # privileged positive route. If its lock identity cannot be resolved,
+        # fail closed instead of running unguarded.
+        result = DispatchResult()
+        result.skipped_unauthorized.append(task_id)
+        return result
+
+    with _dispatch_tick_lock(db_path) as held:
+        if not held:
+            result = DispatchResult(skipped_locked=True)
+        else:
+            current = get_task(conn, task_id)
+            if current is None or current.assignee != expected_assignee:
+                result = DispatchResult()
+                result.skipped_unauthorized.append(task_id)
+            else:
+                result = _dispatch_once_locked(
+                    conn,
+                    spawn_fn=spawn_fn,
+                    ttl_seconds=ttl_seconds,
+                    dry_run=dry_run,
+                    max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
+                    failure_limit=failure_limit,
+                    stale_timeout_seconds=0,
+                    board=board,
+                    default_assignee=None,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                    reconcile_orphans=False,
+                    exact_task_id=task_id,
+                    expected_assignee=expected_assignee,
+                    dispatch_authority="controller",
+                    authorize_dispatch=authorize_dispatch,
+                    run_maintenance=False,
+                )
+            _maybe_checkpoint_wal(conn, db_path)
+    _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    return result
+
+
+def _profile_allows_dispatch(callback, name: str, authority: str) -> bool:
+    """Call the profile policy without changing generic callback compatibility."""
+
+    if authority == "generic":
+        return bool(callback(name))
+    return bool(callback(name, authority=authority))
+
+
+def _controller_claim_still_authorized(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    expected_assignee: Optional[str],
+) -> bool:
+    """Re-read exact task/profile authority at the final spawn boundary."""
+    if expected_assignee is None:
+        return True
+    current = get_task(conn, claimed.id)
+    if (
+        current is None
+        or current.status != "running"
+        or current.assignee != expected_assignee
+        or current.claim_lock != claimed.claim_lock
+        or current.current_run_id != claimed.current_run_id
+    ):
+        return False
+    try:
+        from hermes_cli.profiles import profile_dispatch_allowed
+
+        return bool(
+            profile_dispatch_allowed(expected_assignee, authority="controller")
+        )
+    except Exception:
+        return False
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -9901,6 +10407,11 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    exact_task_id: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
+    dispatch_authority: str = "generic",
+    authorize_dispatch=None,
+    run_maintenance: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9942,34 +10453,54 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
-    if reconcile_orphans:
+    if dispatch_authority not in {"generic", "controller"}:
+        raise ValueError("dispatch authority is invalid")
+    if dispatch_authority == "controller" and (
+        not exact_task_id
+        or not expected_assignee
+        or not callable(authorize_dispatch)
+    ):
+        raise ValueError("controller dispatch requires exact task authorization")
+    if dispatch_authority != "controller" and expected_assignee is not None:
+        raise ValueError("expected assignee is reserved for controller dispatch")
+    if run_maintenance:
+        result.reclaimed = release_stale_claims(conn)
+    if run_maintenance and reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
+    if run_maintenance:
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
+    _crash_auto_blocked = (
+        getattr(detect_crashed_workers, "_last_auto_blocked", [])
+        if run_maintenance else []
     )
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     # Rate-limited requeues (quota wall, no failure counted) — surface for
     # telemetry / tests. These tasks went back to ``ready`` and the respawn
     # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
+    _crash_rate_limited = (
+        getattr(detect_crashed_workers, "_last_rate_limited", [])
+        if run_maintenance else []
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    if run_maintenance:
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Reconciliation/bookkeeping above remains live during a pause, but every
+    # new worker path below is fenced here and again immediately before claim.
+    if not new_work_dispatch_allowed():
+        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -10033,19 +10564,32 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
-    ready_rows = conn.execute(
+    ready_sql = (
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "WHERE status = 'ready' AND claim_lock IS NULL"
+    )
+    ready_params: tuple = ()
+    if exact_task_id is not None:
+        ready_sql += " AND id = ?"
+        ready_params = (exact_task_id,)
+    ready_rows = conn.execute(
+        ready_sql + " ORDER BY priority DESC, created_at ASC", ready_params
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
     if review_dispatch_enabled():
-        review_rows = conn.execute(
+        review_sql = (
             "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
+            "WHERE status = 'review' AND claim_lock IS NULL"
+        )
+        review_params: tuple = ()
+        if exact_task_id is not None:
+            review_sql += " AND id = ?"
+            review_params = (exact_task_id,)
+        review_rows = conn.execute(
+            review_sql + " ORDER BY priority DESC, created_at ASC",
+            review_params,
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
@@ -10062,13 +10606,15 @@ def _dispatch_once_locked(
         if not review_rows:
             return False
         try:
-            from hermes_cli.profiles import profile_exists as _rpe
+            from hermes_cli.profiles import profile_dispatch_allowed as _rpe
         except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
+            return False
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            row["assignee"]
+            and _profile_allows_dispatch(
+                _rpe, row["assignee"], dispatch_authority
+            )
+            for row in review_rows
         )
 
     ready_budget = spawn_budget
@@ -10097,22 +10643,24 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # We also resolve generic profile dispatchability once here.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
-            from hermes_cli.profiles import profile_exists as _pe
+            from hermes_cli.profiles import profile_dispatch_allowed as _pe
             _default_assignee_resolved = bool(_pe(_default_assignee))
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
+            # downstream dispatch-policy check on the assigned row will
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
+            break
+        if not new_work_dispatch_allowed():
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -10158,21 +10706,26 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
+        # Skip ready tasks whose assignee is not generically dispatchable.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
+        # control-plane lane (e.g. an interactive Claude Code terminal like
+        # ``orion-cc`` / ``orion-research``). Controller-only profiles are
+        # likewise reserved for an authenticated orchestrator. Those lanes
+        # are pulled directly via ``claim_task`` and should NEVER auto-spawn — the
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
         try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+            from hermes_cli.profiles import profile_dispatch_allowed
         except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+            profile_dispatch_allowed = None  # type: ignore[assignment]
+        if (
+            profile_dispatch_allowed is None
+            or not _profile_allows_dispatch(
+                profile_dispatch_allowed, row_assignee, dispatch_authority
+            )
+        ):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10227,13 +10780,40 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if authorize_dispatch is not None:
+            current = get_task(conn, row["id"])
+            try:
+                authorized = current is not None and bool(
+                    authorize_dispatch("pre-claim", current)
+                )
+            except Exception:
+                authorized = False
+            if not authorized:
+                result.skipped_unauthorized.append(row["id"])
+                continue
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_assignee=expected_assignee,
+        )
         if claimed is None:
+            current = get_task(conn, row["id"])
+            if (
+                expected_assignee is not None
+                and current is not None
+                and current.assignee != expected_assignee
+            ):
+                result.skipped_unauthorized.append(row["id"])
             continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+            elif claimed.workspace_kind == "isolated_clone":
+                workspace, resolved_branch_name = _resolve_isolated_clone_workspace(
+                    claimed, board=board
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -10246,9 +10826,34 @@ def _dispatch_once_locked(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        if claimed.workspace_kind in {"worktree", "isolated_clone"}:
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Workspace resolution may perform slow filesystem/git I/O. Recheck
+        # the host-wide ESTOP after that work and immediately before invoking
+        # any spawn implementation. A pause here restores the claim without
+        # consuming its failure budget.
+        if not new_work_dispatch_allowed():
+            _release_claim_for_dispatch_pause(conn, claimed)
+            continue
+        if authorize_dispatch is not None:
+            try:
+                authorized = bool(authorize_dispatch("pre-spawn", claimed))
+            except Exception:
+                authorized = False
+            if authorized:
+                authorized = _controller_claim_still_authorized(
+                    conn, claimed, expected_assignee
+                )
+            if not authorized:
+                _release_claim_for_dispatch_pause(
+                    conn,
+                    claimed,
+                    outcome="dispatch_authorization_revoked",
+                    summary="controller authorization revoked before worker startup",
+                )
+                result.skipped_unauthorized.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -10263,6 +10868,23 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
+            # A custom spawn hook can cross the ESTOP boundary internally.
+            # Once it returns successfully, work is in-flight even when no PID
+            # is available. Preserve that claim: ESTOP pauses new work and does
+            # not kill admitted work, while releasing here could double-run a
+            # surviving process tree after resume.
+            if not new_work_dispatch_allowed():
+                _record_spawn_admitted_across_dispatch_pause(
+                    conn, claimed, int(pid) if pid else None
+                )
+                _fire_worker_spawned_hook(
+                    conn, claimed, str(workspace), pid, board=board,
+                )
+                result.spawned.append(
+                    (claimed.id, claimed.assignee or "", str(workspace))
+                )
+                spawned += 1
+                continue
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10288,6 +10910,20 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _DispatchPausedDuringSpawn as paused:
+            if paused.pid and not paused.terminated:
+                _record_spawn_admitted_across_dispatch_pause(
+                    conn, claimed, paused.pid
+                )
+                _fire_worker_spawned_hook(
+                    conn, claimed, str(workspace), paused.pid, board=board,
+                )
+                result.spawned.append(
+                    (claimed.id, claimed.assignee or "", str(workspace))
+                )
+                spawned += 1
+            else:
+                _release_claim_for_dispatch_pause(conn, claimed)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10319,14 +10955,21 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if not new_work_dispatch_allowed():
+            break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
         try:
-            from hermes_cli.profiles import profile_exists
+            from hermes_cli.profiles import profile_dispatch_allowed
         except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+            profile_dispatch_allowed = None  # type: ignore[assignment]
+        if (
+            profile_dispatch_allowed is None
+            or not _profile_allows_dispatch(
+                profile_dispatch_allowed, row["assignee"], dispatch_authority
+            )
+        ):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
@@ -10354,13 +10997,40 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if authorize_dispatch is not None:
+            current = get_task(conn, row["id"])
+            try:
+                authorized = current is not None and bool(
+                    authorize_dispatch("pre-claim", current)
+                )
+            except Exception:
+                authorized = False
+            if not authorized:
+                result.skipped_unauthorized.append(row["id"])
+                continue
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_assignee=expected_assignee,
+        )
         if claimed is None:
+            current = get_task(conn, row["id"])
+            if (
+                expected_assignee is not None
+                and current is not None
+                and current.assignee != expected_assignee
+            ):
+                result.skipped_unauthorized.append(row["id"])
             continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+            elif claimed.workspace_kind == "isolated_clone":
+                workspace, resolved_branch_name = _resolve_isolated_clone_workspace(
+                    claimed, board=board
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -10373,7 +11043,7 @@ def _dispatch_once_locked(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        if claimed.workspace_kind in {"worktree", "isolated_clone"}:
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
@@ -10384,6 +11054,27 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        if not new_work_dispatch_allowed():
+            _release_claim_for_dispatch_pause(conn, claimed)
+            continue
+        if authorize_dispatch is not None:
+            try:
+                authorized = bool(authorize_dispatch("pre-spawn", claimed))
+            except Exception:
+                authorized = False
+            if authorized:
+                authorized = _controller_claim_still_authorized(
+                    conn, claimed, expected_assignee
+                )
+            if not authorized:
+                _release_claim_for_dispatch_pause(
+                    conn,
+                    claimed,
+                    outcome="dispatch_authorization_revoked",
+                    summary="controller authorization revoked before worker startup",
+                )
+                result.skipped_unauthorized.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -10395,6 +11086,18 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
+            if not new_work_dispatch_allowed():
+                _record_spawn_admitted_across_dispatch_pause(
+                    conn, claimed, int(pid) if pid else None
+                )
+                _fire_worker_spawned_hook(
+                    conn, claimed, str(workspace), pid, board=board,
+                )
+                result.spawned.append(
+                    (claimed.id, claimed.assignee or "", str(workspace))
+                )
+                spawned += 1
+                continue
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
@@ -10408,6 +11111,20 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _DispatchPausedDuringSpawn as paused:
+            if paused.pid and not paused.terminated:
+                _record_spawn_admitted_across_dispatch_pause(
+                    conn, claimed, paused.pid
+                )
+                _fire_worker_spawned_hook(
+                    conn, claimed, str(workspace), paused.pid, board=board,
+                )
+                result.spawned.append(
+                    (claimed.id, claimed.assignee or "", str(workspace))
+                )
+                spawned += 1
+            else:
+                _release_claim_for_dispatch_pause(conn, claimed)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10896,6 +11613,9 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    if not new_work_dispatch_allowed():
+        log_f.close()
+        raise _DispatchPausedDuringSpawn()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
@@ -10912,6 +11632,16 @@ def _default_spawn(
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
+    if not new_work_dispatch_allowed():
+        # The kernel has admitted the child, so it is now in-flight under the
+        # ESTOP contract. Do not leader-kill and release its claim: descendants
+        # may survive, and resume could then double-dispatch the same task.
+        # Report the boundary crossing so the caller keeps the exact PID/claim.
+        log_f.close()
+        raise _DispatchPausedDuringSpawn(
+            pid=proc.pid,
+            terminated=False,
         )
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The

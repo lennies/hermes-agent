@@ -39,6 +39,19 @@ def test_engage_creates_sentinel_and_is_engaged(hermes_home):
     assert estop.is_engaged() is True
 
 
+def test_named_profile_observes_the_install_global_sentinel(
+    hermes_home, monkeypatch
+):
+    profile = hermes_home / "profiles/delivery-maintainer"
+    profile.mkdir(parents=True)
+    estop.engage(reason="global cutover")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    assert estop.sentinel_path() == hermes_home / "ESTOP"
+    assert estop.is_engaged() is True
+
+
 def test_disengage_removes_sentinel(hermes_home):
     estop.engage()
     assert estop.disengage() is True

@@ -220,8 +220,8 @@ SEND_MESSAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "list", "react", "unreact"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                "enum": ["send", "list", "react", "unreact", "find", "ensure"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction. 'find' and 'ensure' provide actor-bound repository-delivery marker readback for an explicit Slack thread."
             },
             "target": {
                 "type": "string",
@@ -238,6 +238,18 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            },
+            "marker": {
+                "type": "string",
+                "description": "For action='find'/'ensure': exact repository-delivery marker in an explicit Slack thread."
+            },
+            "workspace_id": {
+                "type": "string",
+                "description": "For action='find'/'ensure': expected authenticated Slack workspace ID."
+            },
+            "actor_id": {
+                "type": "string",
+                "description": "For action='find'/'ensure': expected authenticated Slack bot user ID."
             }
         },
         "required": []
@@ -258,7 +270,97 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
+    if action in {"find", "ensure"}:
+        return _handle_find_or_ensure(args, ensure=action == "ensure")
+
     return _handle_send(args)
+
+
+def _handle_find_or_ensure(args, *, ensure):
+    """Read or idempotently create one exact bot-authored Slack marker."""
+    target = str(args.get("target") or "")
+    marker = str(args.get("marker") or "")
+    message = str(args.get("message") or "")
+    workspace_id = str(args.get("workspace_id") or "")
+    actor_id = str(args.get("actor_id") or "")
+    if (
+        not target
+        or not marker
+        or not workspace_id
+        or not actor_id
+        or (ensure and not message)
+    ):
+        return tool_error(
+            "Slack marker operations require target, marker, workspace_id, and "
+            "actor_id; ensure also requires message"
+        )
+    parts = target.split(":", 1)
+    if len(parts) != 2 or parts[0].strip().lower() != "slack":
+        return tool_error("Marker find/ensure supports only explicit Slack threads")
+    prepare_send_message_platforms()
+    chat_id, thread_id, resolution_error = resolve_send_target("slack", parts[1])
+    if resolution_error:
+        return tool_error(resolution_error)
+    if not chat_id or not thread_id:
+        return tool_error("Marker find/ensure requires slack:conversation:thread")
+    try:
+        from gateway.config import Platform, load_gateway_config
+        from model_tools import _run_async
+        from plugins.platforms.slack.adapter import (
+            ensure_standalone_thread_marker,
+            find_standalone_thread_marker,
+        )
+
+        config = load_gateway_config()
+        pconfig = config.platforms.get(Platform.SLACK)
+        if not pconfig or not pconfig.enabled:
+            return tool_error("Platform 'slack' is not configured")
+
+        def read_marker():
+            return _run_async(
+                find_standalone_thread_marker(
+                    pconfig,
+                    chat_id,
+                    thread_id,
+                    marker,
+                    workspace_id,
+                    actor_id,
+                )
+            )
+
+        before = read_marker()
+        if not isinstance(before, dict) or before.get("error"):
+            return json.dumps(
+                before
+                if isinstance(before, dict)
+                else _error("Slack marker read returned an invalid result")
+            )
+        if before.get("found"):
+            if ensure and before.get("text") != message:
+                return tool_error("Slack marker exists with different message text")
+            return json.dumps({**before, "action": "found"})
+        if not ensure:
+            return json.dumps({**before, "action": "absent"})
+
+        result = _run_async(
+            ensure_standalone_thread_marker(
+                pconfig,
+                chat_id,
+                thread_id,
+                marker,
+                message,
+                workspace_id,
+                actor_id,
+            )
+        )
+        if not isinstance(result, dict):
+            return tool_error("Slack marker ensure returned an invalid result")
+        if result.get("error"):
+            return json.dumps(result)
+        action = "created" if result.pop("created", False) else "found"
+        return json.dumps({**result, "action": action})
+    except Exception as error:
+        return json.dumps(_error(f"Slack marker operation failed: {error}"))
 
 
 def _handle_list():

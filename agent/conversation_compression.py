@@ -270,6 +270,36 @@ def _cached_prompt_reflects_builtin_memory(agent: Any, cached_prompt: str) -> bo
     return True
 
 
+def _freeze_trusted_policy_snapshot_for_rebuild(
+    agent: Any,
+    cached_prompt: Any,
+) -> None:
+    """Bind a compression rebuild to its byte-zero startup policy snapshot.
+
+    Legacy prompts without a snapshot envelope retain their compatibility
+    path. Once the envelope is present, however, configured policy, explicit
+    absence, and corruption are all authoritative session state: corruption
+    is retained as INVALID so rendering fails closed rather than consulting
+    current config or disk.
+    """
+    if not isinstance(cached_prompt, str) or not cached_prompt:
+        return
+    from agent.prompt_builder import (
+        TrustedPolicySnapshotKind,
+        inspect_trusted_policy_snapshot,
+        render_trusted_policy_snapshot_block,
+    )
+
+    snapshot = inspect_trusted_policy_snapshot(cached_prompt)
+    if snapshot.kind is TrustedPolicySnapshotKind.INVALID and not snapshot.frame_present:
+        return
+    agent._trusted_policy_snapshot_state = snapshot
+    if snapshot.kind is TrustedPolicySnapshotKind.INVALID:
+        # Use the public fail-closed renderer so every session-bound consumer
+        # gets one corruption contract and error type.
+        render_trusted_policy_snapshot_block(snapshot)
+
+
 _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_previous_summary",
     "_summary_has_user_turn",
@@ -2340,6 +2370,10 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    _freeze_trusted_policy_snapshot_for_rebuild(
+        agent,
+        getattr(agent, "_cached_system_prompt", None),
+    )
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )

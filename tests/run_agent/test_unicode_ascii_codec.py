@@ -4,6 +4,8 @@ Covers the fix for issue #6843 — systems with ASCII locale (LANG=C)
 that can't encode non-ASCII characters in API request payloads.
 """
 
+from pathlib import Path
+
 import pytest
 
 from run_agent import (
@@ -156,6 +158,62 @@ class TestSanitizeStructureNonAscii:
         assert _sanitize_structure_non_ascii(payload) is True
         assert payload["default_headers"]["X-Title"] == "Hermes  Agent"
         assert payload["default_headers"]["User-Agent"] == "Hermes/1.0 "
+
+    def test_verified_policy_prefix_is_preserved_and_suffix_is_sanitized(self):
+        from agent.prompt_builder import (
+            LoadedGlobalInstructions,
+            render_trusted_policy_prefix,
+        )
+
+        loaded = LoadedGlobalInstructions(
+            content="Host policy exact.",
+            resolved_path=Path("/opt/elfbot/AGENTS.md"),
+            sha256="a" * 64,
+        )
+        framed = render_trusted_policy_prefix("Identity", loaded)
+        system_prompt = framed + "\n\nProject context Ω"
+        payload = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "lower trust Ω"},
+            ]
+        }
+
+        assert _sanitize_structure_non_ascii(
+            payload,
+            protected_prefixes=(framed,),
+        ) is True
+        assert payload["messages"][0]["content"] == framed + "\n\nProject context "
+        assert payload["messages"][1]["content"] == "lower trust "
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "lower trust Ω"},
+        ]
+        assert _sanitize_messages_non_ascii(
+            messages,
+            protected_prefixes=(framed,),
+        ) is True
+        assert messages[0]["content"] == framed + "\n\nProject context "
+        assert messages[1]["content"] == "lower trust "
+
+    def test_non_ascii_trusted_prefix_fails_closed(self):
+        from agent.conversation_loop import _trusted_policy_ascii_protected_prefixes
+        from agent.prompt_builder import (
+            GlobalInstructionsError,
+            LoadedGlobalInstructions,
+            render_trusted_policy_prefix,
+        )
+
+        loaded = LoadedGlobalInstructions(
+            content="Host policy Ω.",
+            resolved_path=Path("/opt/elfbot/AGENTS.md"),
+            sha256="a" * 64,
+        )
+        prompt = render_trusted_policy_prefix("Identity", loaded)
+
+        with pytest.raises(GlobalInstructionsError, match="ASCII-only transport"):
+            _trusted_policy_ascii_protected_prefixes(prompt)
 
 
 class TestApiKeyClientSync:

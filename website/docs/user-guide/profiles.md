@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # Profiles: Running Multiple Agents
 
-Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
+Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state. The optional host-wide `global_instructions_file` is the deliberate exception: it is shared from the default Hermes root.
 
 ## What are profiles?
 
@@ -54,7 +54,7 @@ You can also set or auto-generate the description later with `hermes profile des
 hermes profile create work --clone
 ```
 
-Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into the new profile. Same API keys, model, and capabilities, but fresh sessions and memory. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
+Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into the new profile. Same API keys, model, and capabilities, but fresh sessions and memory. The host-global `global_instructions_file` key is not copied into the named profile; it continues to resolve from the default root. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
 
 ### Clone everything (`--clone-all`)
 
@@ -197,6 +197,12 @@ Each profile has its own:
 - **`config.yaml`** — model, provider, toolsets, all settings
 - **`.env`** — API keys, bot tokens
 - **`SOUL.md`** — personality and instructions
+
+`global_instructions_file` is not profile-local. Configure it only in the
+default root `config.yaml`; named-profile configs containing the key are
+rejected. Clone, export, and import remove it from named-profile artifacts.
+Named-profile CLI/dashboard reads show the shared effective value; writes are
+rejected, while `config unset` can repair a legacy invalid local copy.
 
 ```bash
 coder config set model.default anthropic/claude-sonnet-4

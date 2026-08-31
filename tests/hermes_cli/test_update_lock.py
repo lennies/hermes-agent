@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
+    HANDOFF_TOKEN_ENV,
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
     describe_holder,
@@ -30,9 +31,8 @@ from hermes_cli.update_lock import (
     update_marker_path,
 )
 
-# A pid no live process owns. os.kill(pid, 0) must report it dead so a crashed
-# updater can never wedge every future update. Deliberately larger than any
-# platform's pid_t so it also covers the corrupt-marker path (OverflowError).
+# A pid no live process owns. Deliberately larger than any platform's pid_t so
+# it also covers the corrupt-marker path (OverflowError).
 DEAD_PID = 4294967294
 
 
@@ -41,13 +41,13 @@ def marker(tmp_path):
     return tmp_path / ".hermes-update-in-progress"
 
 
-def test_marker_path_follows_process_hermes_home(tmp_path, monkeypatch):
+def test_marker_path_uses_canonical_install_root_for_named_profile(tmp_path, monkeypatch):
     """The lock must land where the Rust updater and Electron gate look.
 
     All three resolve the *process* HERMES_HOME; a profile-scoped path would
     put the lock somewhere the other two owners never read.
     """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "delivery-maintainer"))
     assert update_marker_path() == tmp_path / ".hermes-update-in-progress"
 
 
@@ -60,7 +60,8 @@ def test_acquire_writes_pid_and_start_time(marker):
     lines = marker.read_text(encoding="utf-8").splitlines()
     assert int(lines[0]) == os.getpid(), "the Electron gate probes this pid for liveness"
     assert int(lines[1]) == pytest.approx(time.time(), abs=5)
-    assert len(lines) == 2, "wire format is exactly pid + started_at"
+    assert len(lines) == 3, "the compatible wire format adds an ownership token"
+    assert len(lines[2]) >= 32
 
 
 def test_second_acquire_is_refused_while_the_first_is_live(marker):
@@ -73,6 +74,36 @@ def test_second_acquire_is_refused_while_the_first_is_live(marker):
     assert second.holder is not None
     assert second.holder.pid == os.getpid()
     assert second.acquired is False
+
+
+def test_atomic_create_never_overwrites_a_concurrent_owner(marker, monkeypatch):
+    from hermes_cli import update_lock as update_lock_module
+
+    payload = f"{os.getpid()}\n{int(time.time())}\n"
+
+    def concurrent_create(*_args, **_kwargs):
+        marker.write_text(payload, encoding="utf-8")
+        raise FileExistsError(marker)
+
+    monkeypatch.setattr(update_lock_module.os, "open", concurrent_create)
+    lock = UpdateLock(path=marker)
+
+    assert lock.acquire() is False
+    assert lock.acquired is False
+    assert marker.read_text(encoding="utf-8") == payload
+
+
+def test_partial_owned_marker_fails_closed_for_operator_recovery(marker, monkeypatch):
+    from hermes_cli import update_lock as update_lock_module
+
+    def failed_write(*_args, **_kwargs):
+        raise OSError("simulated marker write failure")
+
+    monkeypatch.setattr(update_lock_module.os, "write", failed_write)
+    with UpdateLock(path=marker) as lock:
+        assert lock.acquired is False
+    assert marker.exists()
+    assert UpdateLock(path=marker).acquire() is False
 
 
 def test_refused_lock_does_not_delete_the_live_owners_marker(marker):
@@ -104,21 +135,36 @@ def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     assert marker.exists(), "the partner's marker is not ours to remove"
 
 
-def test_dead_owner_is_reclaimed_not_honored(marker):
+def test_dead_owner_fails_closed_until_operator_recovery(marker):
     marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True
-    assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+    assert lock.acquire() is False
+    assert lock.holder is not None
+    assert lock.holder.unverifiable is True
+    assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == DEAD_PID
 
 
-def test_owner_past_the_age_ceiling_is_reclaimed(marker):
-    """A live-but-wedged updater must not hold the lock forever."""
+def test_live_owner_past_the_ui_age_ceiling_is_not_stolen(marker):
+    """Age cannot make a still-live updater safe to overwrite."""
     long_ago = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
     marker.write_text(f"{os.getpid()}\n{long_ago}\n", encoding="utf-8")
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True
+    assert lock.acquire() is False
+    assert marker.exists()
+
+
+def test_pid_probe_failure_preserves_the_lease(monkeypatch):
+    """An inconclusive liveness probe cannot authorize concurrent mutation."""
+    from gateway import status
+    from hermes_cli.update_lock import _pid_alive
+
+    def unavailable(_pid):
+        raise RuntimeError("probe unavailable")
+
+    monkeypatch.setattr(status, "_pid_exists", unavailable)
+    assert _pid_alive(DEAD_PID) is True
 
 
 @pytest.mark.parametrize(
@@ -126,18 +172,23 @@ def test_owner_past_the_age_ceiling_is_reclaimed(marker):
     ["", "not-a-pid\n123\n", "\n\n", "12345"],
     ids=["empty", "garbage-pid", "blank-lines", "no-start-time"],
 )
-def test_malformed_markers_never_block_an_update(marker, body):
+def test_malformed_markers_fail_closed_without_mutation(marker, body):
     marker.write_text(body, encoding="utf-8")
 
-    assert read_live_update(path=marker) is None
-    assert UpdateLock(path=marker).acquire() is True
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.unverifiable is True
+    assert UpdateLock(path=marker).acquire() is False
+    assert marker.read_text(encoding="utf-8") == body
 
 
-def test_stale_marker_is_removed_on_read(marker):
+def test_stale_marker_is_preserved_on_read(marker):
     marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
 
-    assert read_live_update(path=marker) is None
-    assert not marker.exists(), "whoever notices a stale marker clears it"
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.unverifiable is True
+    assert marker.exists(), "ordinary readers never unlink an unowned lease"
 
 
 def test_absent_marker_reports_no_live_update(marker):
@@ -165,16 +216,12 @@ def test_describe_holder_names_the_pid_and_elapsed_time(marker):
     assert "already running" in message
 
 
-def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
-    """Degrade to pre-lock behavior rather than refusing to update at all.
-
-    An unwritable marker path is a worse reason to block an update than the
-    race the lock prevents.
-    """
+def test_unwritable_marker_location_blocks_the_update(tmp_path):
+    """An unprovable lease must fail closed before the install is mutated."""
     lock = UpdateLock(path=tmp_path / "nonexistent-file" / "marker")
     (tmp_path / "nonexistent-file").write_text("i am a file, not a dir", encoding="utf-8")
 
-    assert lock.acquire() is True
+    assert lock.acquire() is False
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
 
 
@@ -189,8 +236,10 @@ class TestHandoffFromOrchestratingUpdater:
 
     def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
         # Stand in for the parent updater with our own (live) pid.
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        token = "a" * 48
+        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n{token}\n", encoding="utf-8")
         monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
+        monkeypatch.setenv(HANDOFF_TOKEN_ENV, token)
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True
@@ -208,6 +257,15 @@ class TestHandoffFromOrchestratingUpdater:
         lock = UpdateLock(path=marker)
         assert lock.acquire() is False
         assert lock.holder is not None
+
+    def test_handoff_pid_without_matching_token_grants_nothing(self, marker, monkeypatch):
+        marker.write_text(
+            f"{os.getpid()}\n{int(time.time())}\n{'a' * 48}\n", encoding="utf-8"
+        )
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
+        monkeypatch.setenv(HANDOFF_TOKEN_ENV, "b" * 48)
+
+        assert UpdateLock(path=marker).acquire() is False
 
     @pytest.mark.parametrize("value", ["", "not-a-pid", "-1", "0"], ids=["empty", "garbage", "negative", "zero"])
     def test_malformed_handoff_values_fall_back_to_refusal(self, marker, monkeypatch, value):

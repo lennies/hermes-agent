@@ -622,9 +622,12 @@ class TestSecondaryProfileConfigHandling:
             runner._profile_adapters[profile_name] = {}
             return 2
 
-        def fake_profiles_to_serve(multiplex, profile_allowlist=None):
+        def fake_profiles_to_serve(
+            multiplex, profile_allowlist=None, *, generic_dispatch_only=False
+        ):
             assert multiplex is True
             assert profile_allowlist == ["bad", "good"]
+            assert generic_dispatch_only is True
             return [
                 ("default", Path("/tmp/default")),
                 ("bad", Path("/tmp/bad")),
@@ -673,7 +676,7 @@ class TestSecondaryProfileConfigHandling:
 
         monkeypatch.setattr(
             "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex, profile_allowlist=None: [
+            lambda multiplex, profile_allowlist=None, *, generic_dispatch_only=False: [
                 ("default", Path("/tmp/default")),
                 ("unsafe", Path("/tmp/unsafe")),
             ],
@@ -831,5 +834,4 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
 

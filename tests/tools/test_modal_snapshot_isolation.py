@@ -88,6 +88,11 @@ def _install_modal_test_modules(
         def init_session(self):
             pass
 
+        def execute(self, command: str, **_kwargs):
+            """Exercise the production execute hook without a real subprocess."""
+            self._before_execute()
+            return {"output": command, "returncode": 0}
+
     # Stub _ThreadedProcessHandle: modal.py imports it but only uses it at
     # runtime inside _run_bash; the snapshot-isolation tests never call _run_bash,
     # so a class placeholder is sufficient.
@@ -122,6 +127,9 @@ def _install_modal_test_modules(
         _file_mtime_key=_file_mtime_key,
     )
     sys.modules["tools.interrupt"] = types.SimpleNamespace(is_interrupted=lambda: False)
+    sys.modules["tools.lazy_deps"] = types.SimpleNamespace(
+        ensure=lambda *_args, **_kwargs: None
+    )
     sys.modules["tools.credential_files"] = types.SimpleNamespace(
         get_credential_file_mounts=lambda: [],
         iter_skills_files=lambda **kw: [],
@@ -212,6 +220,55 @@ def test_modal_environment_migrates_legacy_snapshot_key_and_uses_snapshot_id(tmp
         assert json.loads(snapshot_store.read_text()) == {"direct:task-legacy": "im-legacy123"}
     finally:
         env.cleanup()
+
+
+def test_host_context_free_persistent_modal_omits_mounts_sync_and_snapshots(tmp_path):
+    state = _install_modal_test_modules(tmp_path)
+    credential_module = sys.modules["tools.credential_files"]
+    credential_module.get_credential_file_mounts = lambda: [
+        {"host_path": "/host/credential", "container_path": "/root/.token"}
+    ]
+    credential_module.iter_skills_files = lambda **_kw: [
+        {"host_path": "/host/skill", "container_path": "/root/.skill"}
+    ]
+    credential_module.iter_cache_files = lambda **_kw: [
+        {"host_path": "/host/cache", "container_path": "/root/.cache"}
+    ]
+    state["snapshot_store"].parent.mkdir(parents=True, exist_ok=True)
+    state["snapshot_store"].write_text(
+        json.dumps({"direct:default": "im-host-context"}), encoding="utf-8"
+    )
+    modal_module = _load_module(
+        "tools.environments.modal", TOOLS_DIR / "environments" / "modal.py"
+    )
+    modal_module.FileSyncManager = lambda *_args, **_kwargs: pytest.fail(
+        "host-context-free Modal must not create a sync manager"
+    )
+    modal_module.iter_sync_files = lambda *_args, **_kwargs: pytest.fail(
+        "host-context-free Modal must not enumerate host files"
+    )
+
+    env = modal_module.ModalEnvironment(
+        image="python:3.11",
+        include_host_context=False,
+    )
+    try:
+        assert env.execute("printf ready") == {
+            "output": "printf ready",
+            "returncode": 0,
+        }
+        assert state["from_id_calls"] == []
+        assert state["create_calls"][0]["image"] == {
+            "kind": "registry",
+            "image": "python:3.11",
+        }
+        assert "mounts" not in state["create_calls"][0]
+    finally:
+        env.cleanup()
+
+    assert json.loads(state["snapshot_store"].read_text()) == {
+        "direct:default": "im-host-context"
+    }
 
 
 def test_resolve_modal_image_uses_snapshot_ids_and_registry_images(tmp_path):

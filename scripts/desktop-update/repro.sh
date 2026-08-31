@@ -120,7 +120,7 @@ case "$MODE" in
     # Result JSON must survive hostile strings (git allows `"` in branch
     # names; messages carry arbitrary text) -- parse it back with python.
     QHOME="$G/qhome"; mkdir -p "$QHOME/hermes-agent"
-    bash "$SCRIPT_DIR/posix.sh" --no-ui --no-marker-cleanup --desktop-pid 0 \
+    bash "$SCRIPT_DIR/posix.sh" --daemonized --no-ui --no-marker-cleanup --desktop-pid 0 \
       --install-root "$QHOME/hermes-agent" --branch 'evil"branch\n$(x)' >/dev/null 2>&1 || true
     if python3 -c "import json,sys; d=json.load(open('$QHOME/.hermes-update-result.json')); sys.exit(0 if d['branch']=='evil\"branch\\\\n\$(x)' and d['ok']==False else 1)"; then
       printf 'ok   result JSON escapes hostile branch/message\n'
@@ -157,13 +157,13 @@ case "$MODE" in
     mkdir -p "$UNPACKED"
     printf '#!/bin/sh\nexit 1\n' > "$UNPACKED/hermes"; chmod +x "$UNPACKED/hermes"
     if [ "$(uname)" != "Darwin" ]; then
-      bash "$SCRIPT_DIR/posix.sh" --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
+      bash "$SCRIPT_DIR/posix.sh" --daemonized --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
         --relaunch-target "$UNPACKED/hermes" >/dev/null 2>&1 || true
       expect_msg "instant-exit relaunch downgrades to manual" "d['ok']==True and d['manual']==True and 'Reopen Hermes' in d['message']"
     else
       # mac: a SUPPLIED target that is missing is a REJECTED launch and
       # must downgrade to manual — never a clean "Update complete."
-      bash "$SCRIPT_DIR/posix.sh" --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
+      bash "$SCRIPT_DIR/posix.sh" --daemonized --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
         --relaunch-target "$L/NoSuch.app" >/dev/null 2>&1 || true
       expect_msg "missing bundle downgrades to manual" "d['ok']==True and d['manual']==True and 'Reopen Hermes' in d['message']"
     fi
@@ -171,7 +171,7 @@ case "$MODE" in
     # 2. gated skew: success result carries the skew message (the manual
     #    event's payload), never a bare "Update complete."
     stub_install
-    bash "$SCRIPT_DIR/posix.sh" --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
+    bash "$SCRIPT_DIR/posix.sh" --daemonized --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
       --relaunch-target /opt/Hermes/hermes >/dev/null 2>&1 || true
     if [ "$(uname)" != "Darwin" ]; then
       expect_msg "skew outcome surfaces in result message" "d['ok']==True and d['manual']==True and 'was not changed' in d['message']"

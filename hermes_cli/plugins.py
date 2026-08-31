@@ -28,7 +28,8 @@ points.
 Tool registration
 -----------------
 ``PluginContext.register_tool()`` delegates to ``tools.registry.register()``
-so plugin-defined tools appear alongside the built-in tools.
+so plugin-defined tools appear alongside the built-in tools. Plugins may also
+register profile-scoped composite toolsets without mutating core ``toolsets``.
 """
 
 from __future__ import annotations
@@ -1808,6 +1809,90 @@ class PluginContext:
         )
         return handle
 
+    @_serialized_replacement
+    def register_toolset(
+        self,
+        name: str,
+        description: str,
+        tools: List[str],
+        includes: Optional[List[str]] = None,
+    ) -> Optional[PluginRegistration]:
+        """Register one closed, profile-scoped composite toolset.
+
+        This is the plugin-safe alternative to mutating ``toolsets.TOOLSETS``.
+        A plugin cannot replace a built-in or another live plugin toolset.
+        """
+
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name)
+            or not isinstance(description, str)
+            or not description.strip()
+            or len(description) > 500
+            or not isinstance(tools, list)
+            or not tools
+            or any(
+                not isinstance(tool, str)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", tool)
+                for tool in tools
+            )
+            or len(set(tools)) != len(tools)
+        ):
+            raise ValueError("Plugin toolset definition is invalid")
+        includes = [] if includes is None else includes
+        if (
+            not isinstance(includes, list)
+            or any(
+                not isinstance(included, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", included)
+                for included in includes
+            )
+            or len(set(includes)) != len(includes)
+            or name in includes
+        ):
+            raise ValueError("Plugin toolset includes are invalid")
+
+        from toolsets import TOOLSETS
+        from tools.registry import registry
+
+        if name in TOOLSETS:
+            raise ValueError(f"Plugin cannot replace built-in toolset: {name}")
+        scope = self._manager.scope_key
+        previous = registry.snapshot_toolset_registration(name, scope=scope)
+        if previous is not None:
+            logger.warning(
+                "Plugin %s tried to shadow profile toolset %s",
+                self.manifest.name,
+                name,
+            )
+            return None
+        registered = registry.register_toolset(
+            name,
+            description.strip(),
+            list(tools),
+            list(includes),
+            scope=scope,
+        )
+        self._manager._plugin_toolset_names.add(name)
+
+        def _restore_toolset(replacement: Any) -> bool:
+            return registry.restore_toolset_registration(
+                name,
+                registered,
+                replacement,
+                scope=scope,
+            )
+
+        return self._track_replacement(
+            "toolset",
+            name,
+            slot=("toolset", scope, name),
+            current=registered,
+            previous=previous,
+            restore=_restore_toolset,
+            finalize=lambda: self._manager._remove_toolset_name_if_unowned(name),
+        )
+
     # -- capability probing (#64228) -----------------------------------------
 
     def has_capability(self, capability: str) -> bool:
@@ -3485,6 +3570,7 @@ class PluginManager:
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
+        self._plugin_toolset_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
@@ -3695,6 +3781,15 @@ class PluginManager:
         ):
             self._plugin_tool_names.discard(name)
 
+    def _remove_toolset_name_if_unowned(self, name: str) -> None:
+        if not any(
+            registration.active
+            and registration.kind == "toolset"
+            and registration.key == name
+            for registration in self._registration_order
+        ):
+            self._plugin_toolset_names.discard(name)
+
     def _remove_platform_name_if_unowned(self, name: str) -> None:
         if not any(
             registration.active
@@ -3890,6 +3985,7 @@ class PluginManager:
             self._hooks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
+            self._plugin_toolset_names.clear()
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
             self._plugin_commands.clear()
@@ -6744,7 +6840,7 @@ def get_plugin_toolsets() -> List[tuple]:
     alongside the built-in ones and can be toggled on/off per platform.
     """
     manager = get_plugin_manager()
-    if not manager._plugin_tool_names:
+    if not manager._plugin_tool_names and not manager._plugin_toolset_names:
         return []
 
     try:
@@ -6761,6 +6857,12 @@ def get_plugin_toolsets() -> List[tuple]:
             continue
         ts = entry.toolset
         toolset_tools.setdefault(ts, []).append(entry.name)
+    for toolset_name in manager._plugin_toolset_names:
+        definition = registry.get_registered_toolset(toolset_name)
+        if definition is not None:
+            toolset_tools.setdefault(toolset_name, []).extend(
+                definition.get("tools", [])
+            )
 
     # Map toolsets back to the plugin that registered them
     for _name, loaded in manager._plugins.items():

@@ -134,6 +134,10 @@ CASES = {
         ["scripts/tests/test-install-ps1-longpath.ps1"],
         _lanes(python=True, installer=True),
     ),
+    "desktop update PowerShell → installer": (
+        ["scripts/desktop-update/windows.ps1"],
+        _lanes(python=True, installer=True),
+    ),
     "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
     # `.rs` lives under apps/, so it matches `frontend` too. That lane builds
     # TypeScript and cannot notice a Rust error — before `rust` existed it was

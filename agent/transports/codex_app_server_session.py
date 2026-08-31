@@ -24,11 +24,14 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -59,6 +62,72 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+
+def _resolve_kanban_writable_root(env: Mapping[str, str]) -> Optional[str]:
+    """Return the narrow board root needed by a Kanban worker, if any."""
+    if not env.get("HERMES_KANBAN_TASK"):
+        return None
+    kanban_db = env.get("HERMES_KANBAN_DB")
+    if kanban_db:
+        return os.path.dirname(kanban_db)
+    return env.get(
+        "HERMES_KANBAN_ROOT",
+        os.path.join(
+            env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "kanban",
+        ),
+    )
+
+
+def _host_owned_codex_overrides(
+    permission_profile: str,
+    routing: "_ServerRequestRouting",
+    cwd: str,
+) -> list[str]:
+    """Return CLI-precedence safety settings that project config cannot widen."""
+    approval_bypass = routing.auto_approve_exec and routing.auto_approve_apply_patch
+    if permission_profile == "read-only-with-approval":
+        sandbox_mode = "read-only"
+    elif permission_profile == "full-access" and approval_bypass:
+        sandbox_mode = "danger-full-access"
+    else:
+        # Even an unrestricted terminal profile stays sandboxed until the
+        # user explicitly bypasses Hermes approvals for this process/session.
+        sandbox_mode = "workspace-write"
+    approval_policy = "never" if approval_bypass else "on-request"
+    writable_roots = []
+    if sandbox_mode == "workspace-write":
+        kanban_root = _resolve_kanban_writable_root(os.environ)
+        if kanban_root:
+            writable_roots.append(kanban_root)
+    overrides = [
+        "-c",
+        f'sandbox_mode="{sandbox_mode}"',
+        "-c",
+        f'approval_policy="{approval_policy}"',
+        "-c",
+        'shell_environment_policy.inherit="core"',
+        "-c",
+        f"sandbox_workspace_write.writable_roots={json.dumps(writable_roots)}",
+        "-c",
+        "sandbox_workspace_write.network_access=false",
+    ]
+    # Project-scoped config may define executable MCP servers and hooks that
+    # launch outside Codex's shell sandbox/approval bridge. Pin every possible
+    # project root from cwd through its ancestors to untrusted at CLI/session
+    # precedence. Host-owned user/system MCP configuration remains available.
+    resolved_cwd = Path(cwd).expanduser().resolve(strict=False)
+    project_entries = ",".join(
+        f'{json.dumps(str(candidate))}={{trust_level="untrusted"}}'
+        for candidate in (resolved_cwd, *resolved_cwd.parents)
+    )
+    # Codex's `-c` parser splits dotted keys before parsing TOML values, so a
+    # dotted `projects."/path".trust_level=...` override retains the quote
+    # characters and does not match the canonical path. Replace the whole map
+    # with one inline table so the path strings are parsed as actual map keys.
+    overrides.extend(["-c", f"projects={{{project_entries}}}"])
+    return overrides
 
 
 @dataclass
@@ -278,6 +347,7 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -292,6 +362,9 @@ class CodexAppServerSession:
                 "workspace-write",
             )
         )
+        # Frozen at session construction and sent only while creating the
+        # Codex thread. Existing threads never receive prompt hot-updates.
+        self._developer_instructions = developer_instructions
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -320,7 +393,11 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                extra_args=_host_owned_codex_overrides(
+                    self._permission_profile, self._routing, self._cwd
+                ),
             )
         self._client.initialize(
             client_name="hermes",
@@ -337,12 +414,18 @@ class CodexAppServerSession:
         #      codex requires a matching `[permissions]` table in
         #      ~/.codex/config.toml or it fails the request with
         #      'default_permissions requires a [permissions] table'.
-        # Letting codex pick its default (`:read-only` unless the user has
-        # configured otherwise in their codex config.toml) is the standard
-        # codex CLI workflow and avoids fighting codex's own validation.
-        # Users who want a write-capable profile configure it in their
-        # ~/.codex/config.toml the same way they would for any codex usage.
+        # The stable CLI-precedence overrides supplied at process construction
+        # own sandbox and approval behavior instead. This avoids the unstable
+        # permissions API and prevents cwd-effective config from widening the
+        # boundary selected by Hermes.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._developer_instructions:
+            # This value is the verified, frozen host-policy snapshot. Never
+            # merge cwd-effective Codex configuration here: a trusted project
+            # may provide its own `.codex/config.toml`, and promoting that
+            # lower-trust text into thread/start.developerInstructions would
+            # erase the host/project trust boundary.
+            params["developerInstructions"] = self._developer_instructions
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's

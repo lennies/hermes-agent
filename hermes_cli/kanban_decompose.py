@@ -187,13 +187,18 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
+            if profiles_mod.profile_dispatch_allowed(explicit):
                 return explicit
         except Exception:
             pass
     # Fall back to the active default profile.
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        candidate = profiles_mod.get_active_profile_name() or "default"
+        return (
+            candidate
+            if profiles_mod.profile_dispatch_allowed(candidate)
+            else "default"
+        )
     except Exception:
         return "default"
 
@@ -204,12 +209,17 @@ def _resolve_default_assignee(cfg: dict) -> str:
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
+            if profiles_mod.profile_dispatch_allowed(explicit):
                 return explicit
         except Exception:
             pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        candidate = profiles_mod.get_active_profile_name() or "default"
+        return (
+            candidate
+            if profiles_mod.profile_dispatch_allowed(candidate)
+            else "default"
+        )
     except Exception:
         return "default"
 
@@ -229,6 +239,8 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
     for p in all_profiles:
+        if not profiles_mod.profile_dispatch_allowed(p.name):
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,

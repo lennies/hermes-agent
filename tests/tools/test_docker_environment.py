@@ -56,7 +56,73 @@ def _make_dummy_env(**kwargs):
         persist_across_processes=kwargs.get("persist_across_processes", True),
         shared_container_key=kwargs.get("shared_container_key", ""),
         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
+        include_host_context=kwargs.get("include_host_context", True),
     )
+
+
+def test_host_context_free_mode_omits_credentials_skills_cache_proxy_and_passthrough(
+    monkeypatch, tmp_path
+):
+    from tools import credential_files, env_passthrough
+
+    credential = tmp_path / "credential.json"
+    skill = tmp_path / "skills"
+    cache = tmp_path / "cache"
+    proxy_ca = tmp_path / "proxy-ca.pem"
+    credential.write_text("secret", encoding="utf-8")
+    skill.mkdir()
+    cache.mkdir()
+    proxy_ca.write_text("ca", encoding="utf-8")
+    monkeypatch.setattr(
+        credential_files,
+        "get_credential_file_mounts",
+        lambda: [{"host_path": str(credential), "container_path": "/root/.token"}],
+    )
+    monkeypatch.setattr(
+        credential_files,
+        "get_skills_directory_mount",
+        lambda: [{"host_path": str(skill), "container_path": "/root/.skills"}],
+    )
+    monkeypatch.setattr(
+        credential_files,
+        "get_cache_directory_mounts",
+        lambda: [{"host_path": str(cache), "container_path": "/root/.cache"}],
+    )
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: ["FAKE_HOST_TOKEN"])
+    monkeypatch.setenv("FAKE_HOST_TOKEN", "host-secret")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            ["-v", f"{proxy_ca}:/proxy-ca.pem:ro"],
+            {"HERMES_PROXY_TOKEN": "proxy-secret"},
+            ["--add-host", "proxy.internal:host-gateway"],
+        ),
+    )
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        include_host_context=False,
+        persist_across_processes=False,
+    )
+
+    run_call = next(
+        call[0]
+        for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["run"]
+    )
+    serialized = " ".join(run_call)
+    for forbidden in (
+        str(credential),
+        str(skill),
+        str(cache),
+        str(proxy_ca),
+        "host-secret",
+        "proxy-secret",
+        "proxy.internal",
+    ):
+        assert forbidden not in serialized
 
 
 def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, caplog):
@@ -713,7 +779,32 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-host-context": "included",
     }
+
+
+@pytest.mark.parametrize(
+    ("include_host_context", "expected"),
+    [(True, "included"), (False, "excluded")],
+)
+def test_container_reuse_label_freezes_host_context_posture(
+    monkeypatch, include_host_context, expected
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        task_id="host-context-posture",
+        include_host_context=include_host_context,
+    )
+
+    assert env._labels["hermes-host-context"] == expected
+    run_call = next(
+        call[0]
+        for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["run"]
+    )
+    assert f"hermes-host-context={expected}" in run_call
 
 
 def test_shared_container_key_replaces_profile_identity(monkeypatch):
@@ -841,6 +932,25 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_host_context_free_reuse_requires_excluded_posture_label(monkeypatch):
+    """Isolation must never attach to legacy/credentialed persistent containers."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run_with_reuse(monkeypatch, ps_state="running")
+
+    env = _make_dummy_env(
+        task_id="host-free-reuse",
+        include_host_context=False,
+    )
+
+    ps_call = next(
+        call[0]
+        for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["ps"]
+    )
+    assert "label=hermes-host-context=excluded" in ps_call
+    assert env._container_id == "reused-cid"
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):

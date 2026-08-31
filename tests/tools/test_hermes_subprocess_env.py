@@ -62,6 +62,10 @@ class TestStripByDefault:
         for var in _TIER1_SAMPLE:
             assert var not in result, f"{var} leaked (Tier-1) with inherit_credentials=False"
 
+    def test_repository_delivery_broker_descriptor_is_stripped(self):
+        result = _build({"REPOSITORY_DELIVERY_BROKER_FD": "17"})
+        assert "REPOSITORY_DELIVERY_BROKER_FD" not in result
+
 
     def test_pythonutf8_set(self):
         result = _build()
@@ -85,6 +89,13 @@ class TestInheritCredentials:
         # ...while provider keys survive.
         for var in _PROVIDER_SAMPLE:
             assert var in result
+
+    def test_repository_delivery_broker_descriptor_is_never_inherited(self):
+        result = _build(
+            {"REPOSITORY_DELIVERY_BROKER_FD": "17"},
+            inherit_credentials=True,
+        )
+        assert "REPOSITORY_DELIVERY_BROKER_FD" not in result
 
     def test_pythonutf8_set_when_inheriting(self):
         assert _build(inherit_credentials=True).get("PYTHONUTF8") == "1"

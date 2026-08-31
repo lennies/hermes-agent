@@ -136,6 +136,33 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+_HOST_GLOBAL_CONFIG_KEYS = frozenset({"global_instructions_file"})
+
+
+def _strip_host_global_profile_config(profile_dir: Path) -> None:
+    """Remove host-global keys from a copied/staged named-profile config."""
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        data = read_user_config_raw(config_path)
+    except Exception:
+        # A malformed config cannot manufacture a usable setting; the normal
+        # config loader will surface it independently.
+        return
+    if not isinstance(data, dict) or not (_HOST_GLOBAL_CONFIG_KEYS & data.keys()):
+        return
+    for key in _HOST_GLOBAL_CONFIG_KEYS:
+        data.pop(key, None)
+
+    # Never rewrite through a cloned symlink into the source profile.
+    if config_path.is_symlink():
+        config_path.unlink()
+    from hermes_cli.config import atomic_config_write
+
+    atomic_config_write(config_path, data, sort_keys=False)
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
@@ -711,6 +738,21 @@ class ProfileInfo:
     # Optional user-facing display name from profile.yaml. Presentation
     # only — resolution/comparison/spawn paths always use ``name``.
     display_name: str = ""
+    # Automated Kanban routing policy from profile.yaml. ``controller-only``
+    # profiles are omitted from generic dispatch and decomposition but remain
+    # available to an explicit controller-owned launch path.
+    dispatch_mode: str = "generic"
+
+
+PROFILE_DISPATCH_MODES = frozenset({"generic", "controller-only", "disabled"})
+
+
+def _normalized_dispatch_mode(value: object) -> str:
+    """Return a closed dispatch mode, failing unknown values to disabled."""
+    if value is None or value == "":
+        return "generic"
+    mode = str(value).strip().lower()
+    return mode if mode in PROFILE_DISPATCH_MODES else "disabled"
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -877,12 +919,17 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
-    Returns ``{"description": "", "description_auto": False,
-    "display_name": ""}`` when the file is missing or unreadable. Never
+    Returns generic dispatch metadata when the file is missing. Unreadable or
+    malformed metadata fails dispatch closed. Never
     raises — a corrupt profile.yaml on an unrelated profile must not
     break ``hermes profile list``.
     """
-    empty = {"description": "", "description_auto": False, "display_name": ""}
+    empty = {
+        "description": "",
+        "description_auto": False,
+        "display_name": "",
+        "dispatch_mode": "generic",
+    }
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
         return empty
@@ -891,13 +938,14 @@ def read_profile_meta(profile_dir: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return empty
+        return {**empty, "dispatch_mode": "disabled"}
     if not isinstance(data, dict):
-        return empty
+        return {**empty, "dispatch_mode": "disabled"}
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
         "display_name": str(data.get("display_name") or "").strip(),
+        "dispatch_mode": _normalized_dispatch_mode(data.get("dispatch_mode")),
     }
 
 
@@ -907,6 +955,7 @@ def write_profile_meta(
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,
+    dispatch_mode: Optional[str] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -937,6 +986,13 @@ def write_profile_meta(
             existing["display_name"] = display_name.strip()
         else:
             existing.pop("display_name", None)
+    if dispatch_mode is not None:
+        normalized_mode = str(dispatch_mode).strip().lower()
+        if normalized_mode not in PROFILE_DISPATCH_MODES:
+            raise ValueError(
+                "dispatch mode must be generic, controller-only, or disabled"
+            )
+        existing["dispatch_mode"] = normalized_mode
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).
@@ -975,6 +1031,118 @@ def set_profile_display_name(profile_name: str, display_name: str) -> str:
     return cleaned
 
 
+def set_profile_dispatch_mode(profile_name: str, dispatch_mode: str) -> str:
+    """Set the profile's automated Kanban dispatch policy."""
+    canon = normalize_profile_name(profile_name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+    mode = str(dispatch_mode).strip().lower()
+    if mode not in PROFILE_DISPATCH_MODES:
+        raise ValueError(
+            "dispatch mode must be generic, controller-only, or disabled"
+        )
+    write_profile_meta(profile_dir, dispatch_mode=mode)
+    return mode
+
+
+def _read_profile_dispatch_mode(
+    name: str, *, root: Optional[Path | str] = None
+) -> str:
+    """Read one profile's dispatch mode through a single fail-closed path."""
+    try:
+        canon = normalize_profile_name(name)
+        validate_profile_name(canon)
+        if root is None:
+            if not profile_exists(canon):
+                return "disabled"
+            profile_dir = get_profile_dir(canon)
+        else:
+            machine_root = Path(root).expanduser().resolve()
+            profile_dir = (
+                machine_root
+                if canon == "default"
+                else machine_root / "profiles" / canon
+            )
+            if not profile_dir.is_dir():
+                return "disabled"
+        return read_profile_meta(profile_dir)["dispatch_mode"]
+    except Exception:
+        return "disabled"
+
+
+def profile_dispatch_allowed(
+    name: str,
+    *,
+    authority: str = "generic",
+    root: Optional[Path | str] = None,
+) -> bool:
+    """Whether *authority* may automatically dispatch work to *name*.
+
+    Generic Hermes dispatch and the decomposer use the default authority.
+    A deterministic controller may request ``authority='controller'`` only
+    after independently authenticating its task/run/claim contract.
+    """
+    if authority not in {"generic", "controller"}:
+        return False
+    mode = _read_profile_dispatch_mode(name, root=root)
+    if mode == "generic":
+        return True
+    return mode == "controller-only" and authority == "controller"
+
+
+class ProfileDispatchDeniedError(PermissionError):
+    """An unclaimed full-agent turn targeted a governed profile."""
+
+    reason = "profile_dispatch_denied"
+
+
+def require_unclaimed_profile_turn(
+    name: str, *, root: Optional[Path | str] = None
+) -> str:
+    """Return the canonical profile name or refuse a full unclaimed turn.
+
+    Controller-only profiles may run solely through the exact-task controller
+    dispatch path, which owns an authenticated external claim and a confined
+    spawn callback. Cron, Bot Chat, relay, and direct ``hermes -p ... chat``
+    turns have neither and must never gain controller authority.
+    """
+    canon = normalize_profile_name(name)
+    allowed = profile_dispatch_allowed(canon, root=root)
+    if allowed:
+        return canon
+    raise ProfileDispatchDeniedError(
+        f"Profile '{canon}' does not accept unclaimed chat turns; "
+        "controller-only work must be started by the authenticated controller."
+    )
+
+
+def require_unclaimed_active_profile_turn() -> str:
+    """Fence a single-profile turn using the identity derived from its home.
+
+    ``HERMES_PROFILE`` labels worker attribution and can outlive a profile-home
+    change. It is never runtime authority. A conflicting label is rejected
+    rather than allowed to make a controller-only ``HERMES_HOME`` look generic.
+    Multiplex gateways use their request-scoped home directly and therefore do
+    not call this single-profile helper.
+    """
+    active = get_active_profile_name() or "default"
+    ambient = os.environ.get("HERMES_PROFILE")
+    if ambient:
+        try:
+            labelled = normalize_profile_name(ambient)
+        except ValueError as exc:
+            raise ProfileDispatchDeniedError(
+                "Hermes profile identity does not match the active profile home."
+            ) from exc
+        if labelled != active:
+            raise ProfileDispatchDeniedError(
+                "Hermes profile identity does not match the active profile home."
+            )
+    return require_unclaimed_profile_turn(active)
+
+
 # ---------------------------------------------------------------------------
 # CRUD operations
 # ---------------------------------------------------------------------------
@@ -1005,6 +1173,7 @@ def list_profiles() -> List[ProfileInfo]:
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
             display_name=meta.get("display_name", ""),
+            dispatch_mode=meta.get("dispatch_mode", "disabled"),
         ))
 
     # Named profiles
@@ -1048,6 +1217,7 @@ def list_profiles() -> List[ProfileInfo]:
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
                 display_name=meta.get("display_name", ""),
+                dispatch_mode=meta.get("dispatch_mode", "disabled"),
             ))
 
     return profiles
@@ -1056,6 +1226,8 @@ def list_profiles() -> List[ProfileInfo]:
 def profiles_to_serve(
     multiplex: bool,
     profile_allowlist: Optional[List[str]] = None,
+    *,
+    generic_dispatch_only: bool = False,
 ) -> List[Tuple[str, Path]]:
     """Return the ``(profile_name, hermes_home)`` pairs a gateway should serve.
 
@@ -1069,11 +1241,14 @@ def profiles_to_serve(
     - ``multiplex=True``: returns the default profile plus every valid named
       profile under ``profiles/``, each paired with its own HERMES_HOME. When
       ``profile_allowlist`` is provided, only selected named profiles are
-      included; the default profile is always served.
+      included; the default profile is always served as the listener owner.
+      Turn-starting gateway callers pass ``generic_dispatch_only=True`` to
+      omit controller-only and disabled profiles. Inventory, sessions, cron,
+      and sidebar consumers retain the complete historical enumeration.
 
-    Intentionally lightweight (a directory scan + name validation only): no
-    per-profile config reads, gateway-running probes, or skill counts like
-    :func:`list_profiles`. It runs on gateway startup and must stay cheap.
+    Intentionally lightweight (a directory scan plus the tiny profile metadata
+    read): no per-profile config reads, gateway-running probes, or skill counts
+    like :func:`list_profiles`. It runs on gateway startup and must stay cheap.
 
     The returned ``hermes_home`` is the path to pass to
     ``set_hermes_home_override`` when scoping a turn to that profile.
@@ -1108,6 +1283,8 @@ def profiles_to_serve(
             if not _PROFILE_ID_RE.match(name):
                 continue
             if allowed is not None and name not in allowed:
+                continue
+            if generic_dispatch_only and not profile_dispatch_allowed(name):
                 continue
             serve.append((name, entry))
 
@@ -1289,6 +1466,7 @@ def create_profile(
     # desktop/status surfaces don't warn that a just-created profile is
     # v0/outdated. Leave --clone-all snapshots byte-for-byte apart from the
     # explicit runtime/history stripping above.
+    _strip_host_global_profile_config(profile_dir)
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
 
@@ -2206,6 +2384,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 ignore=_default_export_ignore(profile_dir),
             )
             _stage_extras(staged)
+            _strip_host_global_profile_config(staged)
             _scrub_export_secrets(staged)
             result = _make_profile_archive(base, tmpdir, "default")
             return Path(result)
@@ -2221,6 +2400,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
         )
         _stage_extras(staged)
+        _strip_host_global_profile_config(staged)
         _scrub_export_secrets(staged)
         result = _make_profile_archive(base, tmpdir, canon)
         return Path(result)
@@ -2360,6 +2540,8 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         if archive_root != canon:
             final_source = staging_root / canon
             extracted.rename(final_source)
+
+        _strip_host_global_profile_config(final_source)
 
         shutil.move(str(final_source), str(profile_dir))
 

@@ -192,7 +192,9 @@ class TestNonDiscordProfileRouting:
             assert mock_runner._profile_name_for_source(telegram_source) == "worker"
 
         enumerate_profiles.assert_called_once_with(
-            multiplex=True, profile_allowlist=["worker"]
+            multiplex=True,
+            profile_allowlist=["worker"],
+            generic_dispatch_only=True,
         )
 
     def test_route_outside_allowlist_rejects(self, mock_runner, telegram_source, caplog):
@@ -385,5 +387,4 @@ class TestMultiplexGate:
         discord_source.profile = None
 
         assert mock_runner._profile_name_for_source(discord_source) is None
-
 

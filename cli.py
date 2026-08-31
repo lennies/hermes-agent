@@ -41,11 +41,16 @@ import textwrap
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
+
+_controller_claimed_turn: ContextVar[bool] = ContextVar(
+    "hermes_controller_claimed_turn", default=False
+)
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -21105,6 +21110,14 @@ def main(
     """
     global _active_worktree
 
+    if not gateway and not list_tools and not list_toolsets:
+        if not _controller_claimed_turn.get():
+            from hermes_cli.profiles import (
+                require_unclaimed_active_profile_turn,
+            )
+
+            require_unclaimed_active_profile_turn()
+
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
     # UnicodeEncodeError on cp1252.  No-op on Linux/macOS.
@@ -21657,6 +21670,38 @@ def main(
     
     # Run interactive mode
     cli.run()
+
+
+def _controller_claimed_main(**kwargs):
+    """Run one supervisor-admitted role turn through the otherwise fenced API.
+
+    The public ``main`` entrypoint always enforces generic profile dispatch.
+    Repository-delivery role workers receive one connected claim-bound broker
+    descriptor from their supervisor and use this private seam after consuming
+    their sealed bootstrap. No other gateway, cron, relay, or direct CLI route
+    calls it.
+    """
+
+    import socket
+
+    raw_descriptor = os.environ.get("REPOSITORY_DELIVERY_BROKER_FD", "")
+    try:
+        descriptor = int(raw_descriptor)
+    except (TypeError, ValueError) as error:
+        raise PermissionError("controller claim-bound broker is unavailable") from error
+    if descriptor < 3:
+        raise PermissionError("controller claim-bound broker is unavailable")
+    try:
+        candidate = socket.fromfd(descriptor, socket.AF_UNIX, socket.SOCK_STREAM)
+        candidate.close()
+    except OSError as error:
+        raise PermissionError("controller claim-bound broker is unavailable") from error
+
+    token = _controller_claimed_turn.set(True)
+    try:
+        return main(**kwargs)
+    finally:
+        _controller_claimed_turn.reset(token)
 
 
 if __name__ == "__main__":

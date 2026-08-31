@@ -51,7 +51,8 @@ def test_own_profile_resolves_without_name():
 
 
 def test_named_profile_resolves_when_exists():
-    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True):
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True), \
+         mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=True):
         target = _resolve_bot_chat_target({"id": "j1"}, "research")
     assert target is not None
     assert target["platform"] == BOT_CHAT_PLATFORM
@@ -61,6 +62,20 @@ def test_named_profile_resolves_when_exists():
 def test_unknown_profile_resolves_to_none():
     with mock.patch("hermes_cli.profiles.profile_exists", return_value=False):
         assert _resolve_bot_chat_target({"id": "j1"}, "ghost") is None
+
+
+def test_controller_only_named_profile_does_not_resolve():
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True), \
+         mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=False):
+        assert _resolve_bot_chat_target({"id": "j1"}, "delivery-maintainer") is None
+
+
+def test_controller_only_own_profile_does_not_resolve():
+    with mock.patch(
+        "hermes_cli.profiles.get_active_profile_name",
+        return_value="delivery-maintainer",
+    ), mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=False):
+        assert _resolve_bot_chat_target({"id": "j1"}, "") is None
 
 
 def test_resolve_delivery_targets_combines_with_platform_targets():
@@ -107,8 +122,33 @@ def test_create_validation_accepts_bare_and_existing():
     assert _validate_bot_chat_deliver("bot-chat") is None
     assert _validate_bot_chat_deliver(None) is None
     assert _validate_bot_chat_deliver("telegram:-100") is None
-    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True):
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True), \
+         mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=True):
         assert _validate_bot_chat_deliver("bot-chat:research") is None
+
+
+def test_create_validation_rejects_controller_only_profile():
+    from tools.cronjob_tools import _validate_bot_chat_deliver
+
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True), \
+         mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=False):
+        err = _validate_bot_chat_deliver("bot-chat:delivery-reviewer")
+    assert err is not None
+    assert "controller" in err
+
+
+def test_create_validation_rejects_controller_only_own_profile():
+    from tools.cronjob_tools import _validate_bot_chat_deliver
+
+    with mock.patch(
+        "hermes_cli.profiles.get_active_profile_name",
+        return_value="delivery-reviewer",
+    ), mock.patch(
+        "hermes_cli.profiles.profile_exists", return_value=True
+    ), mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=False):
+        err = _validate_bot_chat_deliver("bot-chat")
+    assert err is not None
+    assert "controller" in err
 
 
 # ── delivery lane ────────────────────────────────────────────────────────────
@@ -152,7 +192,8 @@ def test_deliver_named_profile_uses_p_flag_and_clears_home():
         calls["kwargs"] = kwargs
         return _completed()
 
-    with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
+    with mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=True), \
+         mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
          mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"), \
          mock.patch.dict(sched.os.environ, {"HERMES_HOME": "/tmp/other-profile"}):
         err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "research")
@@ -162,6 +203,17 @@ def test_deliver_named_profile_uses_p_flag_and_clears_home():
     assert argv[1:3] == ["-p", "research"]
     # -p owns resolution; the scheduler's own HERMES_HOME must not leak in.
     assert "HERMES_HOME" not in calls["kwargs"]["env"]
+
+
+def test_deliver_rechecks_controller_only_policy_before_spawn():
+    with mock.patch("hermes_cli.profiles.profile_dispatch_allowed", return_value=False), \
+         mock.patch.object(sched.subprocess, "run") as run:
+        err = _deliver_to_bot_chat(
+            {"id": "j1", "name": "n"}, "out", "delivery-reviewer"
+        )
+    assert err is not None
+    assert "controller" in err
+    run.assert_not_called()
 
 
 def test_deliver_failure_returns_error_string():

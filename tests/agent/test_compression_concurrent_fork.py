@@ -29,6 +29,7 @@ fixture deterministically produces 2 children; with the lock, exactly 1.
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -1230,7 +1231,21 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         ).fetchone()
     )
     parent = _build_agent_with_db(db, parent_sid)
-    parent._cached_system_prompt = "stable parent prompt"
+    from agent.prompt_builder import (
+        LoadedGlobalInstructions,
+        render_trusted_policy_prefix,
+    )
+
+    raw_policy = b"FROZEN REVIEW POLICY V1"
+    policy_path = (tmp_path / "policy.md").resolve()
+    parent._cached_system_prompt = render_trusted_policy_prefix(
+        "PARENT IDENTITY",
+        LoadedGlobalInstructions(
+            content=raw_policy.decode(),
+            resolved_path=policy_path,
+            sha256=hashlib.sha256(raw_policy).hexdigest(),
+        ),
+    )
 
     snapshot = [
         {
@@ -1298,6 +1313,8 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         captured["compression_in_place"] = self.compression_in_place
         captured["session_id"] = self.session_id
         captured["session_db"] = self._session_db
+        captured["skip_context_files"] = self.skip_context_files
+        captured["cached_system_prompt"] = self._cached_system_prompt
         captured["input_budget"] = getattr(
             self, "_review_input_token_budget", "missing"
         )
@@ -1429,6 +1446,10 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         assert captured["compressor_session_id"] == ""
         assert captured["compression_enabled"] is True
         assert captured["compression_in_place"] is True
+        assert captured["skip_context_files"] is True
+        assert captured["cached_system_prompt"] == parent._cached_system_prompt
+        assert hashlib.sha256(raw_policy).hexdigest() in captured["cached_system_prompt"]
+        assert captured["cached_system_prompt"].count("# Trusted Host Policy") == 1
         assert captured["defer_first_request"] is True
         assert isinstance(captured["input_budget"], int) and captured["input_budget"] > 0
 

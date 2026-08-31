@@ -175,6 +175,13 @@ def _(rid, params: dict) -> dict:
         # 'target_busy' extends the #93091 item-1 structured refusal enum.
         if getattr(e, "reason", "") == "target_busy":
             return _err(rid, 5096, str(e))
+        if getattr(e, "reason", "") == "profile_dispatch_denied":
+            return _err(
+                rid,
+                4093,
+                str(e),
+                data={"reason": "profile_dispatch_denied"},
+            )
         return _err(rid, 5094, str(e))
 
 

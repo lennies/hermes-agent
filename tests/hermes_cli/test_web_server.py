@@ -2254,9 +2254,21 @@ class TestWebServerEndpoints:
     def test_export_session_streams_bounded_message_pages(self, monkeypatch):
         from hermes_state import SessionDB
 
+        policy_source = "/Users/operator/AGENTS.md"
+        policy_digest = "a" * 64
+        policy_frame = (
+            "# Trusted Host Policy\n\n"
+            f'Source: "{policy_source}"\n'
+            f"SHA-256: {policy_digest}\n\n"
+            "HOST_POLICY_FRAME_SENTINEL"
+        )
         db = SessionDB()
         try:
-            db.create_session(session_id="stream-export", source="cli")
+            db.create_session(
+                session_id="stream-export",
+                source="cli",
+                system_prompt=policy_frame,
+            )
             db.append_messages_batch(
                 "stream-export",
                 [
@@ -2280,6 +2292,11 @@ class TestWebServerEndpoints:
         assert response.status_code == 200
         payload = response.json()
         assert payload["id"] == "stream-export"
+        assert "system_prompt" not in payload
+        assert "system_prompt_hash" not in payload
+        assert policy_source not in response.text
+        assert policy_digest not in response.text
+        assert "HOST_POLICY_FRAME_SENTINEL" not in response.text
         assert len(payload["messages"]) == 501
         assert payload["messages"][0]["content"] == "msg 0"
         assert payload["messages"][-1]["content"] == "msg 500"

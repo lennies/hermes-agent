@@ -25,6 +25,7 @@
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
+#     [-SelfTestHandoffPython <path>] prove child UpdateLock adoption (tests)
 #
 # SAFETY POSTURE: both preflight gates FAIL CLOSED. A Desktop that never
 # exits, or a venv shim that never unlocks, aborts the hand-off without
@@ -36,10 +37,13 @@
 # Marker: we claim HERMES_HOME\.hermes-update-in-progress with OUR pid as
 # step 0 (the wrapper cmd.exe pid the Desktop saw is useless -- it exits
 # immediately), retaining HERMES_UPDATE_STARTED_AT from the Desktop hand-off.
-# hermes_cli/update_lock.py's ancestry rule lets our
-# `hermes update` child adopt the claim; electron/update-marker.ts parks a
-# relaunched Desktop on it. Cleanup only removes the marker while WE still
-# own it (a handoff partner that rewrote it keeps its claim).
+# hermes_cli/update_lock.py requires our exact PID/token handoff;
+# electron/update-marker.ts parks a relaunched Desktop on it. CreateNew fails
+# closed. Production cleanup deletes through a second identity-binding kernel
+# handle only after re-reading the exact payload owned by this process. The
+# primary handle cannot use DeleteOnClose: Windows marks that pathname delete-
+# pending immediately, which prevents the Python child from reading and
+# adopting the exact PID/token handoff.
 
 param(
     [string]$InstallRoot,
@@ -50,7 +54,8 @@ param(
     [switch]$NoMarkerCleanup,
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
-    [switch]$SelfTestMarker
+    [switch]$SelfTestMarker,
+    [string]$SelfTestHandoffPython = ""
 )
 
 if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
@@ -81,6 +86,9 @@ try {
 } catch {}
 $TempDir = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $TempDir }
+if ((Split-Path -Leaf (Split-Path -Parent $HermesHome)) -eq "profiles") {
+    $HermesHome = Split-Path -Parent (Split-Path -Parent $HermesHome)
+}
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
@@ -88,6 +96,9 @@ $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
 $script:Ui = $null
 $script:UiStage = "Hermes will open once done."   # until the first gate; matches ui.html
 $script:UiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$script:LeaseToken = ""
+$script:LeasePayload = ""
+$script:LeaseStream = $null
 
 function Write-HandoffLog([string]$Message) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
@@ -523,18 +534,70 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
 }
 
 function Remove-MarkerIfOwned {
-    if ($NoMarkerCleanup) { return }
+    $ownedStream = $null
+    $cleanupStream = $null
     try {
-        if (Test-Path -LiteralPath $MarkerPath) {
-            $firstLine = (Get-Content -LiteralPath $MarkerPath -TotalCount 1 -ErrorAction SilentlyContinue)
-            if ("$firstLine".Trim() -eq "$PID") {
-                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
-                Write-HandoffLog "removed update marker (owned)"
+        if ($script:LeaseStream) {
+            # The primary handle denies delete/write sharing for the whole
+            # update while allowing the Python child to read and adopt the
+            # exact PID/token payload. Re-verify through that handle before
+            # releasing it; a mismatched claim is never deleted.
+            $ownedStream = $script:LeaseStream
+            $script:LeaseStream = $null
+            $ownedBytes = [System.Text.Encoding]::ASCII.GetBytes($script:LeasePayload)
+            $ownedStream.Position = 0
+            $observed = New-Object byte[] $ownedBytes.Length
+            $read = $ownedStream.Read($observed, 0, $observed.Length)
+            if ($read -ne $ownedBytes.Length -or $ownedStream.Length -ne $ownedBytes.Length) {
+                throw "owned update marker length changed before cleanup"
+            }
+            for ($i = 0; $i -lt $ownedBytes.Length; $i++) {
+                if ($observed[$i] -ne $ownedBytes[$i]) {
+                    throw "owned update marker payload changed before cleanup"
+                }
+            }
+            $ownedStream.Dispose()
+            $ownedStream = $null
+
+            if ($NoMarkerCleanup) {
+                Write-HandoffLog "leaving update marker (test fixture)"
             } else {
-                Write-HandoffLog "leaving update marker: owned by pid '$firstLine', not us ($PID)"
+                # Re-open exclusively except for delete sharing, re-read the
+                # same payload, then delete while this exact handle remains
+                # open. Compliant contenders cannot replace the live claim in
+                # the small close/re-open interval: the marker still names our
+                # live PID and their create-new acquisition fails closed.
+                $cleanupStream = [System.IO.FileStream]::new(
+                    $MarkerPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete),
+                    4096,
+                    [System.IO.FileOptions]::None
+                )
+                $cleanupStream.Position = 0
+                $cleanupObserved = New-Object byte[] $ownedBytes.Length
+                $cleanupRead = $cleanupStream.Read($cleanupObserved, 0, $cleanupObserved.Length)
+                if ($cleanupRead -ne $ownedBytes.Length -or $cleanupStream.Length -ne $ownedBytes.Length) {
+                    throw "owned update marker length changed during cleanup"
+                }
+                for ($i = 0; $i -lt $ownedBytes.Length; $i++) {
+                    if ($cleanupObserved[$i] -ne $ownedBytes[$i]) {
+                        throw "owned update marker payload changed during cleanup"
+                    }
+                }
+                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction Stop
+                $cleanupStream.Dispose()
+                $cleanupStream = $null
+                Write-HandoffLog "removed update marker (verified owned handle)"
             }
         }
-    } catch {}
+    } catch {
+        Write-HandoffLog "could not remove owned update marker safely: $($_.Exception.Message)"
+    } finally {
+        if ($cleanupStream) { try { $cleanupStream.Dispose() } catch {} }
+        if ($ownedStream) { try { $ownedStream.Dispose() } catch {} }
+    }
 }
 
 function Start-DesktopRelaunch {
@@ -1002,15 +1065,86 @@ try {
         if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
             $startedAt = $epoch
         }
-        # WriteAllText for byte-exact LF framing: Set-Content emits CRLF and
-        # the marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
-        [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
+        $script:LeaseToken = if ($env:HERMES_UPDATE_LEASE_TOKEN) { $env:HERMES_UPDATE_LEASE_TOKEN } else { [Guid]::NewGuid().ToString("N") }
+        $script:LeasePayload = "$PID`n$startedAt`n$($script:LeaseToken)`n"
+        $script:LeaseStream = [System.IO.FileStream]::new(
+            $MarkerPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::Read,
+            4096,
+            [System.IO.FileOptions]::None
+        )
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($script:LeasePayload)
+        $script:LeaseStream.Write($bytes, 0, $bytes.Length)
+        $script:LeaseStream.Flush($true)
+        $script:LeaseStream.Position = 0
+        $published = New-Object byte[] $bytes.Length
+        $read = $script:LeaseStream.Read($published, 0, $published.Length)
+        if ($read -ne $bytes.Length -or $script:LeaseStream.Length -ne $bytes.Length) {
+            throw "update marker publication length could not be verified"
+        }
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            if ($published[$i] -ne $bytes[$i]) {
+                throw "update marker publication payload could not be verified"
+            }
+        }
+        $env:HERMES_UPDATE_HANDOFF_PID = "$PID"
+        $env:HERMES_UPDATE_LEASE_TOKEN = $script:LeaseToken
         Write-HandoffLog "claimed update marker (pid $PID)"
     } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+        if ($script:LeaseStream) {
+            try { $script:LeaseStream.Dispose() } catch {}
+            $script:LeaseStream = $null
+        }
+        $script:LeaseToken = ""
+        $script:LeasePayload = ""
+        $finalCode = 2
+        $finalMsg = "Update aborted: another updater owns the Hermes install lease. Nothing was changed."
+        Write-HandoffLog "$finalMsg ($($_.Exception.Message))"
+        exit $finalCode
     }
 
     if ($SelfTestMarker) {
+        if ($SelfTestHandoffPython) {
+            # Exercise the production handle, not a fixture: while this
+            # FileStream still owns a FileShare.Read claim, so the exact child
+            # PID/token handoff must remain readable and adoptable by Python's
+            # UpdateLock. This is load-bearing on native Windows, where a
+            # DeleteOnClose handle marks the path delete-pending and makes the
+            # child read fail even though read sharing was requested.
+            $probeRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+            $env:HERMES_MARKER_TEST_REPO_ROOT = $probeRoot
+            $env:HERMES_MARKER_TEST_PATH = $MarkerPath
+            $probe = @'
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["HERMES_MARKER_TEST_REPO_ROOT"])
+from hermes_cli.update_lock import UpdateLock
+
+path = Path(os.environ["HERMES_MARKER_TEST_PATH"])
+before = path.read_bytes()
+lock = UpdateLock(path=path)
+if not lock.acquire() or lock.acquired or lock.holder is not None:
+    raise SystemExit("child did not adopt the exact parent PID/token lease")
+lock.release()
+after = path.read_bytes()
+if after != before:
+    raise SystemExit("child adoption changed the parent-owned lease")
+'@
+            # Windows PowerShell 5.1 rebuilds native command lines and strips
+            # the quotes inside a multiline `-c` argument. Carry the probe as
+            # base64 data and keep the bootstrap quote-free so both 5.1 and
+            # pwsh 7 execute the identical source bytes.
+            $encodedProbe = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($probe))
+            $probeBootstrap = "import base64,sys;exec(base64.b64decode(sys.argv[1]))"
+            & $SelfTestHandoffPython "-c" $probeBootstrap $encodedProbe
+            if ($LASTEXITCODE -ne 0) {
+                throw "child Python UpdateLock could not adopt the production lease"
+            }
+        }
         $finalCode = 0
         $finalMsg = "marker self-test complete"
         exit 0

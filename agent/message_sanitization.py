@@ -336,7 +336,11 @@ def _strip_non_ascii(text: str) -> str:
     return text.encode('ascii', errors='ignore').decode('ascii')
 
 
-def _sanitize_messages_non_ascii(messages: list) -> bool:
+def _sanitize_messages_non_ascii(
+    messages: list,
+    *,
+    protected_prefixes: tuple[str, ...] = (),
+) -> bool:
     """Strip non-ASCII characters from all string content in a messages list.
 
     This is a last-resort recovery for systems with ASCII-only encoding
@@ -344,13 +348,20 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
     non-ASCII content was found and sanitized.
     """
     found = False
+
+    def _sanitize(value: str) -> str:
+        for prefix in protected_prefixes:
+            if value.startswith(prefix):
+                return prefix + _strip_non_ascii(value[len(prefix):])
+        return _strip_non_ascii(value)
+
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         # Sanitize content (string)
         content = msg.get("content")
         if isinstance(content, str):
-            sanitized = _strip_non_ascii(content)
+            sanitized = _sanitize(content)
             if sanitized != content:
                 msg["content"] = sanitized
                 found = True
@@ -359,7 +370,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                 if isinstance(part, dict):
                     text = part.get("text")
                     if isinstance(text, str):
-                        sanitized = _strip_non_ascii(text)
+                        sanitized = _sanitize(text)
                         if sanitized != text:
                             part["text"] = sanitized
                             found = True
@@ -448,16 +459,26 @@ def _strip_images_from_messages(messages: list) -> bool:
     return found
 
 
-def _sanitize_structure_non_ascii(payload: Any) -> bool:
-    """Strip non-ASCII characters from nested dict/list payloads in-place."""
+def _sanitize_structure_non_ascii(
+    payload: Any,
+    *,
+    protected_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """Strip non-ASCII while preserving verified byte-zero prompt prefixes."""
     found = False
+
+    def _sanitize(value: str) -> str:
+        for prefix in protected_prefixes:
+            if value.startswith(prefix):
+                return prefix + _strip_non_ascii(value[len(prefix):])
+        return _strip_non_ascii(value)
 
     def _walk(node):
         nonlocal found
         if isinstance(node, dict):
             for key, value in node.items():
                 if isinstance(value, str):
-                    sanitized = _strip_non_ascii(value)
+                    sanitized = _sanitize(value)
                     if sanitized != value:
                         node[key] = sanitized
                         found = True
@@ -466,7 +487,7 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
         elif isinstance(node, list):
             for idx, value in enumerate(node):
                 if isinstance(value, str):
-                    sanitized = _strip_non_ascii(value)
+                    sanitized = _sanitize(value)
                     if sanitized != value:
                         node[idx] = sanitized
                         found = True

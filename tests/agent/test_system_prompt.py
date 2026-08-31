@@ -298,6 +298,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "unless the user explicitly directs you to."
     )
     expected = "\n\n".join((
+        "<!-- hermes:trusted-host-policy-snapshot:none -->",
         "IDENTITY",
         "HELP",
         "STEER",
@@ -327,8 +328,13 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
-    assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    layout = system_prompt.extract_prompt_layout_snapshot(prompt)
+    assert layout is not None
+    assert "\n\n".join(
+        layout[name] for name in ("stable", "context", "volatile") if layout[name]
+    ) == expected
+    assert prompt.startswith(f"{expected}\n\n<!-- hermes:prompt-layout:v1 ")
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

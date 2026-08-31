@@ -107,7 +107,7 @@ TOOLSETS = {
         "tools": ["web_search", "web_extract"],
         "includes": []  # No other toolsets included
     },
-    
+
     "search": {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
@@ -665,6 +665,27 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
     except Exception:
         return toolset if toolset else None
 
+    registered_composite = registry.get_registered_toolset(name)
+    if registered_composite is not None:
+        if toolset is not None:
+            # Plugin registration refuses built-in collisions; retain this
+            # fail-closed guard for registry implementations predating that
+            # check or manually-mutated test doubles.
+            return {
+                **toolset,
+                "tools": sorted(
+                    set(toolset.get("tools", []))
+                    | set(registry.get_tool_names_for_toolset(name))
+                ),
+            }
+        return {
+            **registered_composite,
+            "tools": sorted(
+                set(registered_composite.get("tools", []))
+                | set(registry.get_tool_names_for_toolset(name))
+            ),
+        }
+
     if toolset:
         merged_tools = sorted(
             set(toolset.get("tools", []))
@@ -726,17 +747,18 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
     return to_remove
 
 
-# Resolution memo keyed on (toolset name, include_registry, registry
-# generation). resolve_toolset() recursively walks toolset includes and, with
-# include_registry=True, merges registry-registered tools on every call —
+# Resolution memo keyed on (toolset name, include_registry, registry identity,
+# generation, and project scope). resolve_toolset() recursively walks toolset
+# includes and, with include_registry=True, merges registry-registered tools on every call —
 # measured ~2us/toolset in isolation but called dozens of times per
 # _get_platform_tools() (per-keystroke /tools completion) and per picker
 # render. The registry exposes a monotonic _generation counter (bumped on
 # every register/deregister/alias/MCP refresh — see tools/registry.py), so a
-# cache entry is valid for as long as the generation is unchanged; external
-# callers never pass ``visited``, so the memo engages exactly at the public
-# entry and the internal cycle-detection recursion stays untouched.
-_resolve_toolset_memo: Dict[Tuple[str, bool, int, int], List[str]] = {}
+# cache entry is valid for as long as the generation and project scope are
+# unchanged; external callers never pass ``visited``, so the memo engages
+# exactly at the public entry and the internal cycle-detection recursion stays
+# untouched.
+_resolve_toolset_memo: Dict[Tuple[str, bool, int, int, str], List[str]] = {}
 
 
 def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bool = True) -> List[str]:
@@ -766,10 +788,18 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
 
             registry_id = id(registry)
             generation = getattr(registry, "_generation", 0)
+            registry_scope = registry.current_scope_key()
         except Exception:
             registry_id = 0
             generation = 0
-        memo_key = (name, include_registry, registry_id, generation)
+            registry_scope = ""
+        memo_key = (
+            name,
+            include_registry,
+            registry_id,
+            generation,
+            registry_scope,
+        )
         cached = _resolve_toolset_memo.get(memo_key)
         if cached is not None:
             return list(cached)
@@ -840,14 +870,18 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
 
             registry_id = id(registry)
             generation = getattr(registry, "_generation", 0)
+            registry_scope = registry.current_scope_key()
         except Exception:
             registry_id = 0
             generation = 0
+            registry_scope = ""
         # Entries from previous registry generations are never hit again;
         # keep the memo bounded across long sessions with many MCP refreshes.
         if len(_resolve_toolset_memo) >= 256:
             _resolve_toolset_memo.clear()
-        _resolve_toolset_memo[(name, include_registry, registry_id, generation)] = list(result)
+        _resolve_toolset_memo[
+            (name, include_registry, registry_id, generation, registry_scope)
+        ] = list(result)
     return result
 
 

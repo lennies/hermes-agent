@@ -63,15 +63,19 @@ def _kanban_dispatch_allowed() -> bool:
 
     Checked every dispatcher tick BEFORE spawning new workers so a pause takes
     effect on the next tick without a gateway restart. In-flight workers are
-    never touched — this only stops NEW spawns. Fails open: if the estop
-    module is unimportable, dispatch proceeds (the sentinel gate must not
-    become a new crash surface for the dispatcher).
+    never touched — this only stops NEW spawns. Fails closed: an unavailable
+    stop state is not authority to decompose or spawn new work.
     """
     try:
         from agent.estop import check_paused
-    except ImportError:
-        return True
-    return not check_paused("kanban", logger)
+
+        return not check_paused("kanban", logger)
+    except Exception:
+        logger.exception(
+            "kanban dispatch: emergency-stop state is unavailable; "
+            "spawning no new workers"
+        )
+        return False
 
 
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:

@@ -25,7 +25,7 @@ def isolated_kanban_home(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", test_home)
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+            monkeypatch.delitem(sys.modules, mod, raising=False)
     yield test_home
 
 
@@ -94,3 +94,30 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+def test_cli_dispatch_cannot_bypass_global_estop(
+    isolated_kanban_home, monkeypatch
+):
+    from agent import estop
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db as kb
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="CLI held", assignee="default")
+    estop.engage(reason="profile cutover")
+    spawns = []
+    monkeypatch.setattr(
+        kb,
+        "_default_spawn",
+        lambda task, workspace, board=None: spawns.append(task.id) or 42,
+    )
+
+    args = argparse.Namespace(
+        dry_run=False, max=None, failure_limit=2, json=False
+    )
+    assert kb_cli._cmd_dispatch(args) == 0
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert spawns == []
+    assert task is not None and task.status == "ready"

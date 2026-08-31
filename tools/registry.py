@@ -469,6 +469,10 @@ class ToolRegistry:
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        # Plugin-authored composite toolsets are profile-scoped just like
+        # plugin tools.  They may reference built-in or plugin tool names but
+        # never mutate the process-global static TOOLSETS mapping.
+        self._scoped_toolsets: Dict[str, Dict[str, dict]] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -556,7 +560,12 @@ class ToolRegistry:
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
-        return sorted({entry.toolset for entry in self._snapshot_entries()})
+        with self._lock:
+            names = {entry.toolset for entry in self._merged_tools().values()}
+            names.update(
+                self._scoped_toolsets.get(self.current_scope_key(), {}).keys()
+            )
+            return sorted(names)
 
     def get_all_entries(self) -> List[ToolEntry]:
         """Return the active profile's merged tool entries."""
@@ -590,6 +599,82 @@ class ToolRegistry:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
             return self._toolset_aliases.get(alias)
+
+    def get_registered_toolset(
+        self,
+        name: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Return one profile-scoped composite toolset definition."""
+
+        active_scope = scope or self.current_scope_key()
+        with self._lock:
+            value = self._scoped_toolsets.get(active_scope, {}).get(name)
+            if value is None:
+                return None
+            return {
+                "description": value["description"],
+                "tools": list(value["tools"]),
+                "includes": list(value["includes"]),
+            }
+
+    def snapshot_toolset_registration(
+        self,
+        name: str,
+        *,
+        scope: str,
+    ) -> Optional[dict]:
+        """Return the exact local composite slot for replacement tracking."""
+
+        return self.get_registered_toolset(name, scope=scope)
+
+    def register_toolset(
+        self,
+        name: str,
+        description: str,
+        tools: List[str],
+        includes: List[str],
+        *,
+        scope: str,
+    ) -> dict:
+        """Register a closed profile-scoped composite toolset."""
+
+        value = {
+            "description": description,
+            "tools": tuple(tools),
+            "includes": tuple(includes),
+        }
+        with self._lock:
+            target = self._scoped_toolsets.setdefault(scope, {})
+            if name in target:
+                raise ValueError(f"Toolset already registered in this scope: {name}")
+            target[name] = value
+            self._generation += 1
+        return value
+
+    def restore_toolset_registration(
+        self,
+        name: str,
+        current: dict,
+        previous: Optional[dict],
+        *,
+        scope: str,
+    ) -> bool:
+        """Restore a composite toolset only when its registration is current."""
+
+        with self._lock:
+            target = self._scoped_toolsets.get(scope, {})
+            if target.get(name) != current:
+                return False
+            if previous is None:
+                target.pop(name, None)
+            else:
+                target[name] = previous
+            if not target:
+                self._scoped_toolsets.pop(scope, None)
+            self._generation += 1
+            return True
 
     # ------------------------------------------------------------------
     # Registration

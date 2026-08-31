@@ -18,15 +18,15 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 under a live interpreter and leaving the tree half-updated.
 
 This module makes that same marker the single lock for **all** update
-entrypoints instead of adding a fourth mechanism. Format and location are
-unchanged and remain byte-compatible with the Rust and Electron readers:
+entrypoints instead of adding a fourth mechanism. The first two lines remain
+byte-compatible with deployed Rust and Electron readers:
 
-    <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
+    <install-root>/.hermes-update-in-progress
+        body: "<pid>\\n<started_at_unix>\\n<ownership_token>"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+New writers claim with create-new, fail closed on acquisition errors, and
+remove only the exact inode and payload they created. A live PID is never
+stolen based on age alone.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -34,12 +34,11 @@ sees its own parent's live marker and refuses — the GUI update deadlocks
 against itself on every attempt ("Hermes is still running", retry forever).
 Two mechanisms recognize the orchestrating parent, and either suffices:
 
-* The updater exports :data:`HANDOFF_PID_ENV` naming its own pid, and
-  ``acquire`` treats a live holder matching that pid as the lock we are
-  already running under. The env var alone grants nothing: the pid must also
-  be the live marker owner, so a stale or forged value cannot bypass the lock.
-* A live holder that is a *process ancestor* of ours is likewise our own
-  orchestrator. This is the load-bearing path for the fleet: the staged
+* The updater exports :data:`HANDOFF_PID_ENV` and :data:`HANDOFF_TOKEN_ENV`;
+  both must exactly match the live marker before the child runs under it.
+* A tokenless live holder that is a *process ancestor* of ours is accepted
+  only as a legacy orchestrator. This is the load-bearing path for the fleet:
+  the staged
   ``hermes-setup`` binary under ``~/.hermes`` is only refreshed by a full
   installer run (``copy_self_to_hermes_home`` deliberately no-ops during
   ``--update``), so every desktop whose staged updater predates the
@@ -52,6 +51,8 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,9 +60,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
-# apps/desktop/electron/update-marker.ts — the same marker is read by both, and
-# a shorter ceiling here would let Python steal a lock Electron still considers
-# live. A full update (git pull + uv sync + desktop rebuild) is minutes.
+# apps/desktop/electron/update-marker.ts as a display/test boundary. Lease
+# ownership itself is liveness-based; neither reader steals a live owner by age.
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
@@ -72,6 +72,7 @@ MARKER_NAME = ".hermes-update-in-progress"
 # own parent's lock and the GUI update can never complete. See update_child_env
 # in apps/bootstrap-installer/src-tauri/src/update.rs — keep the name in sync.
 HANDOFF_PID_ENV = "HERMES_UPDATE_HANDOFF_PID"
+HANDOFF_TOKEN_ENV = "HERMES_UPDATE_LEASE_TOKEN"
 
 # Exit code meaning "another updater/instance owns this install right now".
 # Already the de-facto contract: the Windows shim + venv-holder guards in
@@ -85,14 +86,12 @@ UPDATE_EXIT_CONCURRENT = 2
 def update_marker_path() -> Path:
     """Path of the shared update marker.
 
-    Uses the *process* Hermes home (never the context-local profile override):
-    the Rust updater resolves ``$HERMES_HOME`` or the platform default, and the
-    desktop pins that same value into the updater's env. A profile-scoped path
-    here would put the lock somewhere the other two owners never look.
+    Named-profile ``HERMES_HOME`` values resolve to their canonical install
+    root, so every updater contends on one lease for one checkout/runtime.
     """
-    from hermes_constants import get_process_hermes_home
+    from hermes_constants import get_default_hermes_root
 
-    return get_process_hermes_home() / MARKER_NAME
+    return get_default_hermes_root() / MARKER_NAME
 
 
 def _pid_alive(pid: int) -> bool:
@@ -105,8 +104,8 @@ def _pid_alive(pid: int) -> bool:
     process group (bpo-14484). A liveness check that killed the updater it was
     asking about would be a spectacular way to fix a concurrency bug.
 
-    Any pid we cannot evaluate counts as dead: a corrupt marker must not wedge
-    the lock forever.
+    Any pid we cannot evaluate counts as live. Probe failure is not authority
+    to delete another updater's lease or start a concurrent mutation.
     """
     if pid <= 0:
         return False
@@ -115,10 +114,10 @@ def _pid_alive(pid: int) -> bool:
 
         return bool(_pid_exists(pid))
     except Exception as exc:
-        # Import failure or an unusable pid (e.g. larger than the platform's
-        # pid_t). Treat the marker as stale rather than blocking updates.
+        # Import failure or an unusable pid (for example, larger than the
+        # platform's pid_t) is an unknown owner, not proof of death.
         logger.debug("Could not probe pid %s: %s", pid, exc)
-        return False
+        return True
 
 
 def _handoff_pid() -> int | None:
@@ -162,25 +161,70 @@ def _is_ancestor_pid(pid: int) -> bool:
 
 @dataclass(frozen=True)
 class UpdateHolder:
-    """A confirmed-live update currently holding the lock."""
+    """An update marker that makes the install lease unavailable.
 
-    pid: int
-    age_seconds: float
+    ``pid`` is ``None`` when the marker exists but its owner cannot be proven.
+    That state is deliberately blocking: malformed, partial, unreadable, and
+    dead-owner markers require explicit operator recovery and are never stolen
+    by an ordinary updater.
+    """
+
+    pid: int | None
+    age_seconds: float | None
+    token: str | None = None
+    unverifiable: bool = False
+
+
+@dataclass(frozen=True)
+class _MarkerSnapshot:
+    raw: bytes
+    identity: tuple[int, int]
+
+
+def _read_marker_snapshot(marker: Path) -> _MarkerSnapshot | None:
+    descriptor = None
+    try:
+        descriptor = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        if not _marker_metadata_safe(metadata):
+            return None
+        raw = b""
+        while len(raw) <= 1024:
+            chunk = os.read(descriptor, 1025 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > 1024:
+            return None
+        return _MarkerSnapshot(raw=raw, identity=(metadata.st_dev, metadata.st_ino))
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
-    """Return the live update holding the lock, or ``None``.
+    """Return the marker blocking the lock, or ``None`` only when absent.
 
-    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
-    Never raises.
+    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``. A dead,
+    malformed, partial, or unreadable marker is an unverifiable owner and is
+    preserved. Ordinary acquisition never performs stale recovery: a
+    check-then-unlink cleanup can delete a replacement claim created between
+    those operations. Never raises.
     """
     marker = path or update_marker_path()
+    snapshot = _read_marker_snapshot(marker)
+    if snapshot is None:
+        return (
+            UpdateHolder(pid=None, age_seconds=None, unverifiable=True)
+            if os.path.lexists(marker)
+            else None
+        )
     try:
-        raw = marker.read_text(encoding="utf-8")
-    except OSError:
-        return None  # absent or unreadable => no live update
+        raw = snapshot.raw.decode("ascii")
+    except UnicodeDecodeError:
+        return UpdateHolder(pid=None, age_seconds=None, unverifiable=True)
 
     lines = raw.splitlines()
     try:
@@ -192,19 +236,30 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     except (IndexError, ValueError):
         started_at = float("-inf")
 
+    if pid <= 0 or not (started_at > 0 and started_at != float("inf")):
+        return UpdateHolder(pid=None, age_seconds=None, unverifiable=True)
     age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
-        return None
+    # A live updater remains authoritative even after the UI age ceiling.
+    # Long dependency rebuilds are unusual but valid; stealing their lease is
+    # worse than requiring operator recovery for a reused PID.
+    if not _pid_alive(pid):
+        return UpdateHolder(pid=None, age_seconds=None, unverifiable=True)
 
-    return UpdateHolder(pid=pid, age_seconds=age)
+    token = lines[2].strip() if len(lines) > 2 and lines[2].strip() else None
+    return UpdateHolder(pid=pid, age_seconds=age, token=token)
 
 
-def describe_holder(holder: UpdateHolder) -> str:
+def describe_holder(holder: UpdateHolder | None) -> str:
     """One-line, user-facing explanation of who holds the update lock."""
+    if holder is None or holder.unverifiable or holder.pid is None:
+        return (
+            "✗ The Hermes update lease exists but its owner cannot be verified.\n"
+            "\n"
+            "  Nothing was changed. Keep the install stopped and remove the\n"
+            "  .hermes-update-in-progress marker only after confirming that no\n"
+            "  terminal, dashboard, desktop, or installer update is running."
+        )
+    assert holder.age_seconds is not None
     minutes, seconds = divmod(int(max(holder.age_seconds, 0)), 60)
     elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
     return (
@@ -217,48 +272,119 @@ def describe_holder(holder: UpdateHolder) -> str:
     )
 
 
+def _marker_metadata_safe(metadata: os.stat_result) -> bool:
+    """Validate marker ownership without rejecting legacy 0644 markers."""
+    if not stat.S_ISREG(metadata.st_mode):
+        return False
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and metadata.st_uid != geteuid():
+        return False
+    return True
+
+
 class UpdateLock:
     """Context manager owning the shared update marker for this process.
 
     ``acquired`` is False when another live update already holds it — callers
     decide whether that's a hard refusal (CLI/dashboard) or a wait. Releasing
     only removes the marker when *we* still own it, so a marker rewritten by a
-    handoff partner (the Tauri updater overwrites it with its own pid) is never
-    deleted out from under its new owner.
+    handoff partner or replacement owner is never deleted by stale cleanup.
     """
 
     def __init__(self, *, path: Path | None = None) -> None:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self._owned_identity: tuple[int, int] | None = None
+        self._owned_payload: bytes | None = None
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
 
-        A live holder whose pid matches :data:`HANDOFF_PID_ENV` — or is a
-        process ancestor of ours — is our own orchestrating parent (the Tauri
-        updater spawning `hermes update` as a stage): we run under ITS claim
-        rather than refusing or re-writing the marker, and ``release`` leaves
-        the parent's marker untouched. The ancestry path exists because staged
-        updaters older than the HANDOFF_PID_ENV export never send the env var.
+        A token-bearing handoff must match both the explicit PID and token. A
+        tokenless live ancestor is accepted only for deployed staged updaters
+        that predate the token contract. The child never rewrites or releases
+        the parent's marker.
         """
         existing = read_live_update(path=self.path)
         if existing is not None:
-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+            handoff_token = os.environ.get(HANDOFF_TOKEN_ENV, "").strip()
+            token_matches = bool(
+                existing.token and handoff_token and secrets.compare_digest(existing.token, handoff_token)
+            )
+            if (existing.pid == _handoff_pid() and token_matches) or (
+                existing.pid is not None
+                and existing.token is None
+                and _is_ancestor_pid(existing.pid)
+            ):
                 return True
             self.holder = existing
             return False
+        descriptor = None
+        created = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
         except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
-            logger.debug("Could not write update marker %s: %s", self.path, exc)
-            return True
+            logger.error("Could not prepare update marker %s: %s", self.path, exc)
+            return False
+        try:
+            descriptor = os.open(
+                self.path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            metadata = os.fstat(descriptor)
+            if not _marker_metadata_safe(metadata):
+                raise OSError("update marker is unsafe")
+            created = True
+            self._owned_identity = (metadata.st_dev, metadata.st_ino)
+            token = secrets.token_hex(24)
+            payload = f"{os.getpid()}\n{int(time.time())}\n{token}\n".encode("ascii")
+            self._owned_payload = payload
+            written = 0
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count <= 0:
+                    raise OSError("update marker write failed")
+                written += count
+            os.fsync(descriptor)
+            published = _read_marker_snapshot(self.path)
+            if (
+                published is None
+                or published.identity != self._owned_identity
+                or published.raw != self._owned_payload
+            ):
+                raise OSError("update marker publication could not be verified")
+        except FileExistsError:
+            # Another compliant owner won the atomic create after our first
+            # read. Re-read it and refuse instead of overwriting its lease.
+            self.holder = read_live_update(path=self.path)
+            if self.holder is not None:
+                return False
+            logger.debug("Update marker appeared concurrently: %s", self.path)
+            return False
+        except OSError as exc:
+            logger.error("Could not write update marker %s: %s", self.path, exc)
+            if created:
+                # Only clean up the claim opened by this process. Compliant
+                # contenders never remove an unowned pathname, so once our
+                # create-new succeeds no replacement owner can appear until
+                # this exact claim is released.
+                snapshot = _read_marker_snapshot(self.path)
+                if (
+                    snapshot is not None
+                    and snapshot.identity == self._owned_identity
+                    and snapshot.raw == self._owned_payload
+                ):
+                    self.acquired = True
+                    self.release()
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         self.acquired = True
         return True
 
@@ -267,19 +393,32 @@ class UpdateLock:
         if not self.acquired:
             return
         self.acquired = False
+        descriptor = None
         try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
+            descriptor = os.open(
+                self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+            metadata = os.fstat(descriptor)
+            if self._owned_identity != (metadata.st_dev, metadata.st_ino):
+                return
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = None
+                raw = handle.read(256)
+            raw_bytes = raw.encode("utf-8")
+        except OSError:
             return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if self._owned_payload != raw_bytes:
             return
         try:
             self.path.unlink()
         except OSError:
             pass
+        finally:
+            self._owned_identity = None
+            self._owned_payload = None
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

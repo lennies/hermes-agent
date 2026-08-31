@@ -179,10 +179,12 @@ class ModalEnvironment(BaseEnvironment):
         modal_sandbox_kwargs: Optional[dict[str, Any]] = None,
         persistent_filesystem: bool = True,
         task_id: str = "default",
+        include_host_context: bool = True,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
 
         self._persistent = persistent_filesystem
+        self._include_host_context = include_host_context
         self._task_id = task_id
         self._sandbox = None
         self._app = None
@@ -193,7 +195,7 @@ class ModalEnvironment(BaseEnvironment):
 
         restored_snapshot_id = None
         restored_from_legacy_key = False
-        if self._persistent:
+        if self._persistent and self._include_host_context:
             restored_snapshot_id, restored_from_legacy_key = _get_snapshot_restore_candidate(
                 self._task_id
             )
@@ -205,6 +207,8 @@ class ModalEnvironment(BaseEnvironment):
 
         cred_mounts = []
         try:
+            if not self._include_host_context:
+                raise ImportError("host context disabled for this environment")
             from tools.credential_files import (
                 get_credential_file_mounts,
                 iter_skills_files,
@@ -282,14 +286,15 @@ class ModalEnvironment(BaseEnvironment):
 
         logger.info("Modal: sandbox created (task=%s)", self._task_id)
 
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files("/root/.hermes"),
-            upload_fn=self._modal_upload,
-            delete_fn=self._modal_delete,
-            bulk_upload_fn=self._modal_bulk_upload,
-            bulk_download_fn=self._modal_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
+        if self._include_host_context:
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files("/root/.hermes"),
+                upload_fn=self._modal_upload,
+                delete_fn=self._modal_delete,
+                bulk_upload_fn=self._modal_bulk_upload,
+                bulk_download_fn=self._modal_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
         self.init_session()
 
     def _modal_upload(self, host_path: str, remote_path: str) -> None:
@@ -399,7 +404,8 @@ class ModalEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to sandbox via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        if self._sync_manager is not None:
+            self._sync_manager.sync()
 
     # ------------------------------------------------------------------
     # Execution
@@ -448,7 +454,7 @@ class ModalEnvironment(BaseEnvironment):
             logger.info("Modal: syncing files from sandbox...")
             self._sync_manager.sync_back()
 
-        if self._persistent:
+        if self._persistent and self._include_host_context:
             try:
                 async def _snapshot():
                     img = await self._sandbox.snapshot_filesystem.aio()

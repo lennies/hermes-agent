@@ -310,6 +310,7 @@ class TestResolveToolsetMemo:
 
         registry_id = id(registry)
         generation = registry._generation
+        registry_scope = registry.current_scope_key()
 
         first = resolve_toolset("hermes-cli")
         second = resolve_toolset("hermes-cli")
@@ -320,7 +321,7 @@ class TestResolveToolsetMemo:
             f"got {get_toolset_calls['n']} calls"
         )
         assert (
-            "hermes-cli", True, registry_id, generation
+            "hermes-cli", True, registry_id, generation, registry_scope
         ) in toolsets_mod._resolve_toolset_memo
 
     def test_generation_bump_invalidates_memo(self, monkeypatch):
@@ -355,4 +356,3 @@ class TestResolveToolsetMemo:
         second = resolve_toolset("hermes-cli", include_registry=False)
         assert first == second
         assert first  # non-empty sanity
-

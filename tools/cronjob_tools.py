@@ -562,15 +562,24 @@ def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:
         return None
     try:
         from cron.scheduler import parse_bot_chat_deliver_token
-        from hermes_cli.profiles import normalize_profile_name, profile_exists
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            normalize_profile_name,
+            profile_exists,
+            require_unclaimed_profile_turn,
+        )
     except Exception:
         return None  # validation is best-effort; resolution re-checks at fire time
     for part in str(deliver).split(","):
         profile_arg = parse_bot_chat_deliver_token(part.strip())
-        if profile_arg is None or not profile_arg:
-            continue  # not a bot-chat token, or bare token (own profile)
+        if profile_arg is None:
+            continue  # not a bot-chat token
         try:
-            canon = normalize_profile_name(profile_arg)
+            canon = (
+                normalize_profile_name(profile_arg)
+                if profile_arg
+                else (get_active_profile_name() or "default")
+            )
         except Exception:
             return f"invalid bot-chat profile name '{profile_arg}'"
         if not profile_exists(canon):
@@ -580,6 +589,10 @@ def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:
                 "profile that exists here (hermes profile list), or omit the "
                 "name (deliver='bot-chat') for the job's own profile."
             )
+        try:
+            require_unclaimed_profile_turn(canon)
+        except Exception as exc:
+            return f"bot-chat delivery refused: {exc}"
     return None
 
 

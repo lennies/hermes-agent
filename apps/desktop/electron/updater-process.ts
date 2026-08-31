@@ -7,6 +7,7 @@ import { hiddenWindowsChildOptions } from './windows-child-options'
 export interface UpdaterChild {
   pid?: number
   unref: () => void
+  kill?: () => boolean
 }
 
 export interface ResolveUpdateScriptHandoffDeps {
