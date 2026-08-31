@@ -87,12 +87,20 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         import os
         from pathlib import Path
 
+        from agent import coding_context
         from agent.conversation_loop import _restore_or_build_system_prompt
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
         from hermes_cli import plugins
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
         from hermes_state import SessionDB
         from run_agent import AIAgent
+
+        # This test compares persisted plugin-section bytes across fresh
+        # processes. Keep its unrelated live Git snapshot deterministic; the
+        # real workspace block has dedicated coverage in coding_context tests.
+        coding_context.build_coding_workspace_block = (
+            lambda cwd=None: "Workspace (snapshot at session start):\\n- Root: /pinned"
+        )
 
         db = SessionDB(db_path=Path(os.environ["TEST_DB"]))
         session_id = "resume-plugin-section"
