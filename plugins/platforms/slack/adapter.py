@@ -10,6 +10,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
@@ -9004,6 +9005,8 @@ class SlackAdapter(BasePlatformAdapter):
 # send path.  Keyed by "{token}:{user_id}" to support multi-workspace setups.
 _slack_dm_cache: Dict[str, str] = {}
 _SLACK_DM_CACHE_MAX = 5000
+_STANDALONE_MARKER_LOCK_TIMEOUT_SECONDS = 120.0
+_STANDALONE_MARKER_LOCK_POLL_SECONDS = 0.05
 
 
 def _trim_slack_dm_cache() -> None:
@@ -9031,6 +9034,147 @@ def _standalone_tokens(pconfig) -> List[str]:
     return tokens
 
 
+def _standalone_marker_identity_error(
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    workspace_id: str,
+    actor_id: str,
+) -> Optional[str]:
+    """Validate the complete identity bound to a repository-delivery marker."""
+    if not re.fullmatch(r"elfos-repository-delivery:[0-9a-f]{64}", marker or ""):
+        return "Slack marker is invalid"
+    if not re.fullmatch(r"[CGD][A-Z0-9]{8,}", str(chat_id or "")):
+        return "Slack conversation is invalid"
+    if not re.fullmatch(r"\d{10,}(?:\.\d+)?", str(thread_id or "")):
+        return "Slack thread is invalid"
+    if not re.fullmatch(r"T[A-Z0-9]{8,}", str(workspace_id or "")):
+        return "Slack workspace is invalid"
+    if not re.fullmatch(r"[UW][A-Z0-9]{8,}", str(actor_id or "")):
+        return "Slack actor is invalid"
+    return None
+
+
+def _standalone_marker_lock_path(
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    workspace_id: str,
+    actor_id: str,
+) -> _Path:
+    """Return a shared, content-addressed lock path without exposing identity."""
+    from hermes_constants import get_default_hermes_root
+
+    binding = "\0".join((workspace_id, actor_id, chat_id, thread_id, marker))
+    digest = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+    return (
+        get_default_hermes_root()
+        / "run"
+        / "standalone-slack-marker-locks"
+        / f"{digest}.lock"
+    )
+
+
+def _acquire_standalone_marker_lock(
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    workspace_id: str,
+    actor_id: str,
+    *,
+    timeout_seconds: float = _STANDALONE_MARKER_LOCK_TIMEOUT_SECONDS,
+):
+    """Acquire the cross-process mutation claim for one exact Slack marker."""
+    path = _standalone_marker_lock_path(
+        chat_id, thread_id, marker, workspace_id, actor_id
+    )
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    handle = os.fdopen(fd, "a+b")
+    acquired = False
+    try:
+        os.chmod(path, 0o600)
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"\n")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                return handle
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(_STANDALONE_MARKER_LOCK_POLL_SECONDS)
+    finally:
+        if not acquired:
+            handle.close()
+
+
+def _release_standalone_marker_lock(handle) -> None:
+    """Release a claim acquired by :func:`_acquire_standalone_marker_lock`."""
+    try:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            # Closing the descriptor below is the authoritative kernel-level
+            # release even if an explicit unlock races process teardown.
+            pass
+    finally:
+        handle.close()
+
+
+async def _acquire_standalone_marker_lock_async(
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    workspace_id: str,
+    actor_id: str,
+):
+    """Acquire without blocking the event loop or leaking on cancellation."""
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _acquire_standalone_marker_lock,
+            chat_id,
+            thread_id,
+            marker,
+            workspace_id,
+            actor_id,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # asyncio.to_thread cannot stop the worker. Reap its eventual claim
+        # before propagating cancellation so an abandoned descriptor cannot
+        # hold this marker indefinitely in a resident gateway.
+        handle = await task
+        if handle is not None:
+            await asyncio.to_thread(_release_standalone_marker_lock, handle)
+        raise
+
+
 async def find_standalone_thread_marker(
     pconfig,
     chat_id: str,
@@ -9045,16 +9189,11 @@ async def find_standalone_thread_marker(
     token proves channel access. A requester-authored collision fails closed;
     callers never accept text ownership from marker content alone.
     """
-    if not re.fullmatch(r"elfos-repository-delivery:[0-9a-f]{64}", marker or ""):
-        return {"error": "Slack marker is invalid"}
-    if not re.fullmatch(r"[CGD][A-Z0-9]{8,}", str(chat_id or "")):
-        return {"error": "Slack conversation is invalid"}
-    if not re.fullmatch(r"\d{10,}(?:\.\d+)?", str(thread_id or "")):
-        return {"error": "Slack thread is invalid"}
-    if not re.fullmatch(r"T[A-Z0-9]{8,}", str(workspace_id or "")):
-        return {"error": "Slack workspace is invalid"}
-    if not re.fullmatch(r"[UW][A-Z0-9]{8,}", str(actor_id or "")):
-        return {"error": "Slack actor is invalid"}
+    identity_error = _standalone_marker_identity_error(
+        chat_id, thread_id, marker, workspace_id, actor_id
+    )
+    if identity_error:
+        return {"error": identity_error}
     tokens = _standalone_tokens(pconfig)
     if not tokens:
         return {"error": "Slack marker read failed: SLACK_BOT_TOKEN not configured"}
@@ -9198,12 +9337,55 @@ async def ensure_standalone_thread_marker(
 
     Selection of the write token is constrained by ``auth.test`` before the
     mutation. A post-send read always runs, including after an ambiguous HTTP
-    failure, so response loss cannot trigger an unverified retry.
+    failure, so response loss cannot trigger an unverified retry. The entire
+    read/post/read sequence owns a content-addressed cross-process file claim;
+    no database connection is held across provider I/O.
     """
     if type(message) is not str or (
         message != marker and not message.startswith(marker + "\n")
     ):
         return {"error": "Slack marker message is invalid"}
+
+    identity_error = _standalone_marker_identity_error(
+        chat_id, thread_id, marker, workspace_id, actor_id
+    )
+    if identity_error:
+        return {"error": identity_error}
+
+    try:
+        handle = await _acquire_standalone_marker_lock_async(
+            chat_id, thread_id, marker, workspace_id, actor_id
+        )
+    except OSError:
+        return {"error": "Slack marker mutation claim is unavailable"}
+    if handle is None:
+        return {"error": "Slack marker mutation claim timed out"}
+    try:
+        return await _ensure_standalone_thread_marker_claimed(
+            pconfig,
+            chat_id,
+            thread_id,
+            marker,
+            message,
+            workspace_id,
+            actor_id,
+        )
+    finally:
+        await asyncio.shield(
+            asyncio.to_thread(_release_standalone_marker_lock, handle)
+        )
+
+
+async def _ensure_standalone_thread_marker_claimed(
+    pconfig,
+    chat_id: str,
+    thread_id: str,
+    marker: str,
+    message: str,
+    workspace_id: str,
+    actor_id: str,
+) -> Dict[str, Any]:
+    """Run one ensure sequence while the caller owns the durable marker claim."""
 
     before = await find_standalone_thread_marker(
         pconfig,
