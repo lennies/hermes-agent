@@ -9429,6 +9429,7 @@ async def _ensure_standalone_thread_marker_claimed(
                 return {"error": "Slack marker write identity is unavailable"}
 
             send_error = None
+            send_cancelled = None
             try:
                 headers = {
                     "Authorization": f"Bearer {selected_token}",
@@ -9449,26 +9450,58 @@ async def _ensure_standalone_thread_marker_claimed(
                     sent = await response.json()
                 if not sent.get("ok"):
                     send_error = str(sent.get("error") or "unknown")
+            except asyncio.CancelledError as error:
+                # The provider may have committed before cancellation reached
+                # the response await. Preserve cancellation, but do not release
+                # the cross-process claim until an exact readback completes.
+                send_error = "cancelled before provider response"
+                send_cancelled = error
             except Exception as error:
                 send_error = str(error)
 
-        after = await find_standalone_thread_marker(
-            pconfig,
-            chat_id,
-            thread_id,
-            marker,
-            workspace_id,
-            actor_id,
+        readback_task = asyncio.create_task(
+            find_standalone_thread_marker(
+                pconfig,
+                chat_id,
+                thread_id,
+                marker,
+                workspace_id,
+                actor_id,
+            )
         )
+        readback_cancelled = None
+        while True:
+            try:
+                after = await asyncio.shield(readback_task)
+                break
+            except asyncio.CancelledError as error:
+                # A second cancellation still cannot abandon ambiguous
+                # provider state. The read task is shielded and bounded by its
+                # Slack client timeout; retain the first cancellation to raise
+                # after readback.
+                if readback_cancelled is None:
+                    readback_cancelled = error
+                if readback_task.done():
+                    after = readback_task.result()
+                    break
+
+        cancellation = send_cancelled or readback_cancelled
         if after.get("found"):
             if after.get("text") != message:
-                return {"error": "Slack marker readback differs from requested message"}
-            return {**after, "created": True}
-        if after.get("error"):
-            return after
-        if send_error:
-            return {"error": f"Slack marker send failed: {send_error}"}
-        return {"error": "Slack marker send was not visible on exact readback"}
+                result = {
+                    "error": "Slack marker readback differs from requested message"
+                }
+            else:
+                result = {**after, "created": True}
+        elif after.get("error"):
+            result = after
+        elif send_error:
+            result = {"error": f"Slack marker send failed: {send_error}"}
+        else:
+            result = {"error": "Slack marker send was not visible on exact readback"}
+        if cancellation is not None:
+            raise cancellation
+        return result
     except Exception as error:
         return {"error": f"Slack marker send failed: {error}"}
 

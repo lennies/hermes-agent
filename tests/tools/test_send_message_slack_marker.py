@@ -42,9 +42,16 @@ class _Context:
 
 
 class _Session:
-    def __init__(self, messages=None, *, lose_send_response=False):
+    def __init__(
+        self,
+        messages=None,
+        *,
+        lose_send_response=False,
+        cancel_send_response=False,
+    ):
         self.messages = list(messages or [])
         self.lose_send_response = lose_send_response
+        self.cancel_send_response = cancel_send_response
         self.calls = []
 
     async def __aenter__(self):
@@ -75,6 +82,9 @@ class _Session:
         if self.lose_send_response:
             self.lose_send_response = False
             return _Context(error=RuntimeError("response lost"))
+        if self.cancel_send_response:
+            self.cancel_send_response = False
+            return _Context(error=asyncio.CancelledError())
         return _Context({"ok": True, "ts": row["ts"]})
 
     def get(self, url, *, headers, params, **_kwargs):
@@ -181,6 +191,51 @@ def test_ensure_recovers_when_send_response_is_lost(monkeypatch, tmp_path):
     assert result["found"] is True
     assert result["created"] is True
     assert result["text"] == message
+    sends = [call for call in session.calls if call[1].endswith("chat.postMessage")]
+    assert len(sends) == 1
+
+
+def test_cancelled_send_reads_back_before_releasing_claim(monkeypatch, tmp_path):
+    message = MARKER + "\nProduction verified."
+    session = _Session(cancel_send_response=True)
+    _install(monkeypatch, session)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    async def _cancelled_send():
+        try:
+            await adapter.ensure_standalone_thread_marker(
+                SimpleNamespace(token="configured-token"),
+                CHANNEL,
+                THREAD,
+                MARKER,
+                message,
+                WORKSPACE,
+                ACTOR,
+            )
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("provider cancellation was not preserved")
+
+    asyncio.run(_cancelled_send())
+
+    reads = [call for call in session.calls if call[1].endswith("conversations.replies")]
+    sends = [call for call in session.calls if call[1].endswith("chat.postMessage")]
+    assert len(reads) == 2
+    assert len(sends) == 1
+
+    recovered = asyncio.run(
+        adapter.ensure_standalone_thread_marker(
+            SimpleNamespace(token="configured-token"),
+            CHANNEL,
+            THREAD,
+            MARKER,
+            message,
+            WORKSPACE,
+            ACTOR,
+        )
+    )
+    assert recovered["found"] is True
+    assert recovered["message_id"] == "1710000001.123456"
     sends = [call for call in session.calls if call[1].endswith("chat.postMessage")]
     assert len(sends) == 1
 
