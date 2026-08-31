@@ -4952,7 +4952,11 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        # The full CI suite runs eight isolated pytest files concurrently. On
+        # a standard hosted runner this helper thread can be starved for more
+        # than one second even though the lock ordering is correct. Keep the
+        # assertion bounded while allowing normal scheduler variance.
+        assert teardown_started.wait(timeout=5.0)
         assert "slow-orphan" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "orphan teardown kept the global resume lock held"
@@ -15155,6 +15159,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
     monkeypatch.setattr(
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
     )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)

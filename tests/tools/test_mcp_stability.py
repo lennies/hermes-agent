@@ -58,6 +58,26 @@ class TestMCPLoopExceptionHandler:
 class TestStdioPidTracking:
     """_snapshot_child_pids and _stdio_pids track subprocess PIDs."""
 
+    def test_stdio_children_dead_is_false_while_any_child_is_alive(self):
+        """A live tracked child must not trigger the stdio fast-fail path."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("live-child")
+        server._stdio_child_pids = {101, 202}
+
+        with patch("psutil.pid_exists", side_effect=lambda pid: pid == 202):
+            assert server._stdio_children_dead() is False
+
+    def test_stdio_children_dead_is_true_when_all_children_exited(self):
+        """The fast-fail path should activate only after every child exits."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("dead-children")
+        server._stdio_child_pids = {101, 202}
+
+        with patch("psutil.pid_exists", return_value=False):
+            assert server._stdio_children_dead() is True
+
     def test_snapshot_returns_set(self):
         from tools.mcp_tool import _snapshot_child_pids
         result = _snapshot_child_pids()
